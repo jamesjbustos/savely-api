@@ -29,6 +29,6 @@ jobs:
       - name: Run fast provider crons (CardCenter, CardDepot, CardCookie, GCX)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: pnpm exec ts-node-esm scripts/run-fast-crons.ts
+        run: node --loader ts-node/esm scripts/run-fast-crons.ts
 
 
