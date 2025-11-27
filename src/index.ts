@@ -14,6 +14,15 @@ type Env = {
 
 const app = new Hono<{ Bindings: Env }>();
 
+function variantToLabel(
+  variant: string | null | undefined
+): string | null {
+  if (!variant) return null;
+  if (variant === "online") return "Online only";
+  if (variant === "in_store") return "In-store only";
+  return null; // "other" → no label
+}
+
 app.get("/health", (c) => c.text("ok"));
 
 // GET /offers?domain=bestbuy.com
@@ -71,23 +80,27 @@ app.get("/offers", async (c) => {
     base_domain: first.base_domain as string | null,
   };
 
-  const offers = rows.map((r: any) => ({
-    provider: {
-      id: r.provider_id as string,
-      name: r.provider_name as string,
-      slug: r.provider_slug as string,
-    },
-    max_discount_percent:
-      typeof r.max_discount_percent === "number"
-        ? r.max_discount_percent
-        : r.max_discount_percent != null
-        ? Number(r.max_discount_percent)
-        : null,
-    in_stock: !!r.in_stock,
-    fetched_at: r.fetched_at as string | null,
-    product_url: r.product_url as string | null,
-    variant: r.variant as string | null,
-  }));
+  const offers = rows.map((r: any) => {
+    const variant = (r.variant as string | null) ?? null;
+    return {
+      provider: {
+        id: r.provider_id as string,
+        name: r.provider_name as string,
+        slug: r.provider_slug as string,
+      },
+      max_discount_percent:
+        typeof r.max_discount_percent === "number"
+          ? r.max_discount_percent
+          : r.max_discount_percent != null
+          ? Number(r.max_discount_percent)
+          : null,
+      in_stock: !!r.in_stock,
+      fetched_at: r.fetched_at as string | null,
+      product_url: r.product_url as string | null,
+      variant,
+      variant_label: variantToLabel(variant),
+    };
+  });
 
   // Filter to only offers that are both in stock and have a usable URL.
   const clickableOffers = offers.filter(
