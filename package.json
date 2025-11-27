@@ -4,13 +4,30 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --minify",
-    "cf-typegen": "wrangler types --env-interface CloudflareBindings"
+    "cf-typegen": "wrangler types --env-interface CloudflareBindings",
+    "ingest:cardcash": "node scripts/ingest-cardcash.mjs",
+    "validate:cardcash": "node scripts/validate-cardcash.mjs",
+    "ingest:cardcookie": "node scripts/ingest-cardcookie.mjs",
+    "validate:cardcookie": "node scripts/validate-cardcookie.mjs",
+    "ingest:cardcenter": "node scripts/ingest-cardcenter.mjs",
+    "validate:cardcenter": "node scripts/validate-cardcenter.mjs",
+    "ingest:carddepot": "node scripts/ingest-carddepot.mjs",
+    "validate:carddepot": "node scripts/validate-carddepot.mjs",
+    "cron:cardcash": "node scripts/cron-cardcash.mjs",
+    "cron:cardcenter": "node scripts/cron-cardcenter.mjs",
+    "report:cardbear": "node scripts/report-cardbear-brands.mjs",
+    "augment:cardbear-gcx": "node scripts/augment-cardbear-gcx.mjs",
+    "report:cardbear-gcx-fresh": "node scripts/report-cardbear-gcx-fresh.mjs",
+    "ingest:cardbear-seed": "node scripts/ingest-cardbear-seed.mjs",
+    "resolve:brand-domains": "node scripts/resolve-brand-domains.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
+    "cheerio": "^1.1.2",
     "hono": "^4.10.5"
   },
   "devDependencies": {
-    "wrangler": "^4.4.0"
+    "playwright": "^1.49.0",
+    "wrangler": "^4.51.0"
   }
 }

@@ -2,7 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "savely-api",
   "main": "src/index.ts",
-  "compatibility_date": "2025-11-11"
+  "compatibility_date": "2025-11-11",
+  "triggers": {
+    // Fast lane: CardCenter, CardDepot, CardCookie, GCX every 30 minutes
+    // Slow lane: ArbitrageCard every 8 hours
+    "crons": ["*/30 * * * *", "0 */8 * * *"]
+  }
   // "compatibility_flags": [
   //   "nodejs_compat"
   // ],

@@ -44,3 +44,6 @@ lerna-debug.log*
 
 # temp
 temp/*
+
+# api collections
+bruno/bruno-api-collection/*
