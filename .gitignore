@@ -47,3 +47,6 @@ temp/*
 
 # api collections
 bruno/bruno-api-collection/*
+
+# legacy
+legacy/
