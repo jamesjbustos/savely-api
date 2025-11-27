@@ -1,12 +1,5 @@
 import { Hono } from "hono";
-import { getDb } from "./db";
-import {
-  runArbitrageCron,
-  runCardCenterCron,
-  runCardCookieCron,
-  runCardDepotCron,
-  runGcxCron,
-} from "./cron";
+import { getDb } from "./db.ts";
 
 type Env = {
   DATABASE_URL: string;
@@ -125,37 +118,5 @@ export default {
     ctx: { waitUntil(p: Promise<unknown>): void }
   ) {
     return app.fetch(request, env, ctx as any);
-  },
-  scheduled(
-    controller: { cron?: string },
-    env: Env,
-    ctx: { waitUntil(p: Promise<unknown>): void }
-  ) {
-    // Run provider syncs in the background when the cron trigger fires.
-    // We differentiate schedules using the cron expression:
-    // - "*/30 * * * *"   -> fast lane: CardCenter, CardDepot, CardCookie, GCX
-    // - "0 */8 * * *"    -> slow lane: ArbitrageCard (every 8 hours)
-    if (controller.cron === "*/30 * * * *") {
-      ctx.waitUntil(
-        Promise.all([
-          runCardCenterCron(env),
-          runCardDepotCron(env),
-          runCardCookieCron(env),
-          runGcxCron(env),
-        ])
-      );
-    } else if (controller.cron === "0 */8 * * *") {
-      ctx.waitUntil(runArbitrageCron(env));
-    } else {
-      // Fallback: run the fast-lane providers
-      ctx.waitUntil(
-        Promise.all([
-          runCardCenterCron(env),
-          runCardDepotCron(env),
-          runCardCookieCron(env),
-          runGcxCron(env),
-        ])
-      );
-    }
   },
 };

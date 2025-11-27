@@ -1,10 +1,10 @@
-import { getDb } from "./db";
+import { getDb } from "./db.ts";
 import { load as loadHtml } from "cheerio";
 import {
   normalizeBrandName,
   slugifyBrandName,
   mapVariantFromStrings,
-} from "./brandUtils";
+} from "./brandUtils.ts";
 
 type CronEnv = {
   DATABASE_URL: string;
@@ -611,187 +611,209 @@ export async function runCardCookieCron(env: CronEnv) {
 }
 
 export async function runGcxCron(env: CronEnv) {
-  const sql = getDb(env);
+  try {
+    const sql = getDb(env);
 
-  const providerSlug = "gcx";
-  const providerName = "GCX";
+    const providerSlug = "gcx";
+    const providerName = "GCX";
 
-  // Ensure provider exists (idempotent)
-  await sql/* sql */ `
+    // Ensure provider exists (idempotent)
+    await sql/* sql */ `
     insert into providers (name, slug)
     values (${providerName}, ${providerSlug})
     on conflict (slug) do nothing
   `;
 
-  const providerRow = await sql/* sql */ `
+    const providerRow = await sql/* sql */ `
     select id from providers where slug = ${providerSlug} limit 1
   `;
-  if (!providerRow?.[0]?.id) {
-    console.error("Failed to resolve provider id for GCX");
-    return;
-  }
-  const providerId = providerRow[0].id;
-
-  // Existing GCX products keyed by external id (CardBear store id)
-  const existingProducts = await sql/* sql */ `
-    select brand_id, product_url, coalesce(product_external_id, '') as external_id
-    from provider_brand_products
-    where provider_id = ${providerId}
-  `;
-
-  type GcxEntry = {
-    brandId: string;
-    productUrl: string;
-  };
-
-  const byExternalId = new Map<string, GcxEntry>();
-  for (const row of existingProducts as any[]) {
-    const externalId = String(row.external_id ?? "").trim();
-    if (!externalId) continue;
-    byExternalId.set(externalId, {
-      brandId: row.brand_id as string,
-      productUrl: String(row.product_url ?? ""),
-    });
-  }
-
-  // Fetch CardBear discounts once as a trigger for GCX
-  let discounts: any[] = [];
-  try {
-    const resCb = await fetch("https://www.cardbear.com/api/json.php", {
-      headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
-    });
-    if (!resCb.ok) {
-      console.error(`GCX cron: failed to fetch CardBear API: ${resCb.status}`);
+    if (!providerRow?.[0]?.id) {
+      console.error("Failed to resolve provider id for GCX");
       return;
     }
-    const data = await resCb.json();
-    discounts = Array.isArray(data?.discounts) ? data.discounts : [];
-  } catch (err: any) {
-    console.error(
-      "GCX cron: error fetching CardBear API:",
-      err?.message || err
-    );
-    return;
-  }
+    const providerId = providerRow[0].id;
 
-  const nowTs = new Date().toISOString();
+    // Existing GCX products keyed by external id (CardBear store id)
+    const existingProducts = await sql/* sql */ `
+      select brand_id, product_url, coalesce(product_external_id, '') as external_id
+      from provider_brand_products
+      where provider_id = ${providerId}
+    `;
 
-  // Cache GCX responses per slug to avoid duplicate hits
-  const gcxCache = new Map<string, any>();
+    type GcxEntry = {
+      brandId: string;
+      productUrl: string;
+    };
 
-  let updated = 0;
-
-  for (const d of discounts) {
-    const id = String(d.id ?? "").trim();
-    if (!id) continue;
-
-    const reseller = String(d.highestDiscountReseller ?? "").toLowerCase();
-    const isGcx = reseller === "raise" || reseller === "raisecashback";
-    if (!isGcx) continue;
-
-    const mapping = byExternalId.get(id);
-    if (!mapping) {
-      // We don't have a GCX product for this CardBear id; skip.
-      continue;
+    const byExternalId = new Map<string, GcxEntry>();
+    for (const row of existingProducts as any[]) {
+      const externalId = String(row.external_id ?? "").trim();
+      if (!externalId) continue;
+      byExternalId.set(externalId, {
+        brandId: row.brand_id as string,
+        productUrl: String(row.product_url ?? ""),
+      });
     }
 
-    const { brandId, productUrl } = mapping;
+    // Fetch CardBear discounts once as a trigger for GCX
+    let discounts: any[] = [];
+    try {
+      const resCb = await fetch("https://www.cardbear.com/api/json.php", {
+        headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
+      });
+      if (!resCb.ok) {
+        console.error(
+          `GCX cron: failed to fetch CardBear API: ${resCb.status}`
+        );
+        return;
+      }
+      const data = (await resCb.json()) as { discounts?: unknown };
+      const rawDiscounts = (data as any).discounts;
+      discounts = Array.isArray(rawDiscounts) ? rawDiscounts : [];
+    } catch (err: any) {
+      console.error(
+        "GCX cron: error fetching CardBear API:",
+        err?.message || err
+      );
+      return;
+    }
 
-    // Derive slug from our stored GCX product_url, e.g.
-    // https://gcx.raise.com/buy-domino-s-gift-cards
-    const m = productUrl.match(/\/buy-([^/?#]+?)-gift-cards/i);
-    if (!m) continue;
-    const slug = m[1];
-    if (!slug) continue;
+    const nowTs = new Date().toISOString();
 
-    let gcxData: any;
-    if (gcxCache.has(slug)) {
-      gcxData = gcxCache.get(slug);
-    } else {
-      try {
-        const url = `https://gcx.raise.com/query?type=paths&keywords=${encodeURIComponent(
-          slug
-        )}`;
-        const res = await fetch(url, {
-          headers: {
-            "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)",
-            accept: "application/json, text/plain, */*",
-          },
-        });
-        if (!res.ok) {
+    // Cache GCX responses per slug to avoid duplicate hits
+    const gcxCache = new Map<string, any>();
+
+    let updated = 0;
+
+    // Optional safety cap on GCX subrequests per run; high enough that in
+    // practice we cover all brands when running from GitHub Actions / Node.
+    const MAX_GCX_QUERIES = 5000;
+    let gcxQueryCount = 0;
+
+    for (const d of discounts) {
+      const id = String(d.id ?? "").trim();
+      if (!id) continue;
+
+      const reseller = String(d.highestDiscountReseller ?? "").toLowerCase();
+      const isGcx = reseller === "raise" || reseller === "raisecashback";
+      if (!isGcx) continue;
+
+      const mapping = byExternalId.get(id);
+      if (!mapping) {
+        // We don't have a GCX product for this CardBear id; skip.
+        continue;
+      }
+
+      const { brandId, productUrl } = mapping;
+
+      // Derive slug from our stored GCX product_url, e.g.
+      // https://gcx.raise.com/buy-domino-s-gift-cards
+      const m = productUrl.match(/\/buy-([^/?#]+?)-gift-cards/i);
+      if (!m) continue;
+      const slug = m[1];
+      if (!slug) continue;
+
+      let gcxData: any;
+      if (gcxCache.has(slug)) {
+        gcxData = gcxCache.get(slug);
+      } else {
+        if (gcxQueryCount >= MAX_GCX_QUERIES) {
+          console.warn(
+            `GCX cron: reached max query limit (${MAX_GCX_QUERIES}) for this run; remaining brands will be skipped.`
+          );
+          break;
+        }
+        try {
+          const url = `https://gcx.raise.com/query?type=paths&keywords=${encodeURIComponent(
+            slug
+          )}`;
+          const res = await fetch(url, {
+            headers: {
+              "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)",
+              accept: "application/json, text/plain, */*",
+            },
+          });
+          gcxQueryCount += 1;
+          if (!res.ok) {
+            console.error(
+              `GCX cron: query failed for slug=${slug} status=${res.status}`
+            );
+            continue;
+          }
+          gcxData = await res.json();
+          gcxCache.set(slug, gcxData);
+        } catch (err: any) {
           console.error(
-            `GCX cron: query failed for slug=${slug} status=${res.status}`
+            `GCX cron: error querying GCX for slug=${slug}:`,
+            err?.message || err
           );
           continue;
         }
-        gcxData = await res.json();
-        gcxCache.set(slug, gcxData);
-      } catch (err: any) {
-        console.error(
-          `GCX cron: error querying GCX for slug=${slug}:`,
-          err?.message || err
-        );
-        continue;
       }
+
+      if (!gcxData) continue;
+
+      const savings = Number(gcxData.savings ?? 0) || 0;
+      const quantity = Number(gcxData.quantity_available ?? 0) || 0;
+      const available =
+        (gcxData.available === true || gcxData.available === "true") &&
+        quantity > 0 &&
+        savings > 0;
+
+      const maxDiscountPercent = Math.max(0, savings);
+      const inStock = available;
+
+      await sql/* sql */ `
+        insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+        values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
+        on conflict (provider_id, brand_id)
+        do update set
+          max_discount_percent = excluded.max_discount_percent,
+          in_stock = excluded.in_stock,
+          fetched_at = excluded.fetched_at
+      `;
+
+      await sql/* sql */ `
+        update provider_brand_products
+        set
+          is_active = ${inStock},
+          last_seen_at = ${nowTs},
+          last_checked_at = ${nowTs}
+        where provider_id = ${providerId}
+          and brand_id = ${brandId}
+      `;
+
+      updated += 1;
     }
 
-    if (!gcxData) continue;
-
-    const savings = Number(gcxData.savings ?? 0) || 0;
-    const quantity = Number(gcxData.quantity_available ?? 0) || 0;
-    const available =
-      (gcxData.available === true || gcxData.available === "true") &&
-      quantity > 0 &&
-      savings > 0;
-
-    const maxDiscountPercent = Math.max(0, savings);
-    const inStock = available;
-
+    // History snapshot for GCX
     await sql/* sql */ `
-      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
-      values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
-      on conflict (provider_id, brand_id)
-      do update set
-        max_discount_percent = excluded.max_discount_percent,
-        in_stock = excluded.in_stock,
-        fetched_at = excluded.fetched_at
-    `;
-
-    await sql/* sql */ `
-      update provider_brand_products
-      set
-        is_active = ${inStock},
-        last_seen_at = ${nowTs},
-        last_checked_at = ${nowTs}
+      insert into provider_brand_discount_history (
+        provider_id,
+        brand_id,
+        max_discount_percent,
+        in_stock,
+        observed_at
+      )
+      select
+        provider_id,
+        brand_id,
+        max_discount_percent,
+        in_stock,
+        fetched_at
+      from provider_brand_discounts
       where provider_id = ${providerId}
-        and brand_id = ${brandId}
     `;
 
-    updated += 1;
+    console.log(
+      `GCX cron: updated ${updated} brands based on CardBear GCX flags.`
+    );
+  } catch (err: any) {
+    console.error(
+      "GCX cron: fatal error in scheduled run:",
+      err?.message || err
+    );
   }
-
-  // History snapshot for GCX
-  await sql/* sql */ `
-    insert into provider_brand_discount_history (
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      observed_at
-    )
-    select
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      fetched_at
-    from provider_brand_discounts
-    where provider_id = ${providerId}
-  `;
-
-  console.log(
-    `GCX cron: updated ${updated} brands based on CardBear GCX flags.`
-  );
 }
 
 export async function runArbitrageCron(env: CronEnv) {
