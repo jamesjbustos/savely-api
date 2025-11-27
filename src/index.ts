@@ -16,9 +16,12 @@ function variantToLabel(variant: string | null | undefined): string | null {
 
 app.get("/health", (c) => c.text("ok"));
 
-// GET /offers?domain=bestbuy.com
+// GET /offers?domain=bestbuy.com[&in_store=true|false]
 // Returns all provider offers for the brand matching the given base domain,
-// plus a computed bestOffer for convenience.
+// plus a computed bestOffer for convenience. Optional in_store query param:
+//   - in_store=true  → only in-store offers
+//   - in_store=false → only non in-store offers
+//   - omitted        → all offers (default)
 app.get("/offers", async (c) => {
   const rawDomain = c.req.query("domain") || "";
   const domain = rawDomain.trim().toLowerCase();
@@ -28,6 +31,8 @@ app.get("/offers", async (c) => {
   }
 
   const sql = getDb(c.env);
+
+  const inStoreParam = c.req.query("in_store");
 
   // Look up offers via the materialized view, restricted to active brands
   const rows = await sql/* sql */ `
@@ -93,8 +98,19 @@ app.get("/offers", async (c) => {
     };
   });
 
+  // Optionally filter by in-store vs non in-store offers, based on query param.
+  let filteredOffers = offers;
+  if (inStoreParam != null) {
+    const value = inStoreParam.toLowerCase();
+    if (value === "true" || value === "1") {
+      filteredOffers = offers.filter((o) => o.variant === "in_store");
+    } else if (value === "false" || value === "0") {
+      filteredOffers = offers.filter((o) => o.variant !== "in_store");
+    }
+  }
+
   // Filter to only offers that are both in stock and have a usable URL.
-  const clickableOffers = offers.filter(
+  const clickableOffers = filteredOffers.filter(
     (o) => o.in_stock && typeof o.product_url === "string" && o.product_url
   );
 
