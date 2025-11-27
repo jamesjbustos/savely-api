@@ -89,13 +89,19 @@ app.get("/offers", async (c) => {
     variant: r.variant as string | null,
   }));
 
-  // Best offer: first in-stock row by discount (thanks to SQL ordering)
-  const bestOffer = offers.find((o) => o.in_stock) || null;
+  // Filter to only offers that are both in stock and have a usable URL.
+  const clickableOffers = offers.filter(
+    (o) => o.in_stock && typeof o.product_url === "string" && o.product_url
+  );
+
+  // Best offer: first in-stock row by discount, with a non-empty URL
+  // (thanks to SQL ordering, clickableOffers[0] is the best).
+  const bestOffer = clickableOffers[0] || null;
 
   return c.json({
     brand,
     bestOffer,
-    offers,
+    offers: clickableOffers,
   });
 });
 
