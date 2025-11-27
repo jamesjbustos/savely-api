@@ -9,7 +9,7 @@ const app = new Hono<{ Bindings: Env }>();
 
 function variantToLabel(variant: string | null | undefined): string | null {
   if (!variant) return null;
-  if (variant === "online") return "Online only";
+  if (variant === "online") return "Online";
   if (variant === "in_store") return "In-store only";
   return null; // "other" → no label
 }
