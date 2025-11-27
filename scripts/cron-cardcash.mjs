@@ -119,6 +119,32 @@ const API_URL =
   "https://production-api.cardcash.com/v3/merchants/buy?cache=bust";
 const COOKIE_NAME = "q3vsT1zXO";
 
+function buildCardCashProductUrl(slug) {
+  const cleanedSlug = String(slug ?? "").replace(/^\/+/, "");
+
+  // Raw (non-affiliate) CardCash URL
+  const rawUrl = cleanedSlug
+    ? `https://www.cardcash.com/buy-gift-cards/${cleanedSlug}`
+    : "https://www.cardcash.com/buy-gift-cards/";
+
+  // Read affiliate config at call time so values set by loadDevVarsIfPresent()
+  // are visible even though it runs later in main().
+  const siteId = process.env.LINKSYNERGY_SITE_ID || "";
+  const advertiserId = process.env.CARDCASH_ADVERTISER_ID || "45394";
+
+  // If affiliate env is not configured, fall back to raw URL
+  if (!siteId) {
+    return rawUrl;
+  }
+
+  // Build LinkSynergy deep link without needing to hit their API:
+  // https://click.linksynergy.com/deeplink?id=<siteId>&mid=<advertiserId>&murl=<encodedRawUrl>
+  const encodedRaw = encodeURIComponent(rawUrl);
+  return `https://click.linksynergy.com/deeplink?id=${encodeURIComponent(
+    siteId
+  )}&mid=${encodeURIComponent(advertiserId)}&murl=${encodedRaw}`;
+}
+
 async function fetchCardCashMerchants() {
   const browser = await chromium.launch({ headless: true });
   try {
@@ -336,9 +362,7 @@ async function main() {
     // Variant and URL
     const variant = mapCardTypeToVariant(m.cardType ?? null, providerBrandName);
     const slug = String(m.slug ?? "").replace(/^\/+/, "");
-    const productUrl = slug
-      ? `https://www.cardcash.com/buy-gift-cards/${slug}`
-      : "https://www.cardcash.com/buy-gift-cards/";
+    const productUrl = buildCardCashProductUrl(slug);
 
     await sql/* sql */ `
       insert into provider_brand_products
