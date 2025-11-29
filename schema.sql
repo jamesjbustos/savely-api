@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 17.5 (aa1f746)
--- Dumped by pg_dump version 17.5 (aa1f746)
+-- Dumped from database version 17.6 (0d47993)
+-- Dumped by pg_dump version 17.6 (0d47993)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -224,6 +224,35 @@ CREATE TABLE public.brand_domain_reviews (
 ALTER TABLE public.brand_domain_reviews OWNER TO neondb_owner;
 
 --
+-- Name: brand_domains; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_domains (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    domain public.citext NOT NULL,
+    is_primary boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.brand_domains OWNER TO neondb_owner;
+
+--
+-- Name: brand_redeemable_domains; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_redeemable_domains (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    domain public.citext NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.brand_redeemable_domains OWNER TO neondb_owner;
+
+--
 -- Name: brands; Type: TABLE; Schema: public; Owner: neondb_owner
 --
 
@@ -397,6 +426,22 @@ ALTER TABLE ONLY public.brand_domain_reviews
 
 
 --
+-- Name: brand_domains brand_domains_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_domains
+    ADD CONSTRAINT brand_domains_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: brand_redeemable_domains brand_redeemable_domains_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_redeemable_domains
+    ADD CONSTRAINT brand_redeemable_domains_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: brands brands_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -461,6 +506,13 @@ ALTER TABLE ONLY public.providers
 
 
 --
+-- Name: idx_brand_redeemable_by_domain; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_redeemable_by_domain ON public.brand_redeemable_domains USING btree (lower((domain)::text));
+
+
+--
 -- Name: idx_pbd_brand; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -517,6 +569,20 @@ CREATE UNIQUE INDEX uq_brand_domain_review_per_brand ON public.brand_domain_revi
 
 
 --
+-- Name: uq_brand_domain_unique; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE UNIQUE INDEX uq_brand_domain_unique ON public.brand_domains USING btree (lower((domain)::text));
+
+
+--
+-- Name: uq_brand_redeemable_per_brand_domain; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE UNIQUE INDEX uq_brand_redeemable_per_brand_domain ON public.brand_redeemable_domains USING btree (brand_id, lower((domain)::text));
+
+
+--
 -- Name: uq_brands_name_lower; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -567,6 +633,22 @@ ALTER TABLE ONLY public.brand_domain_failures
 
 ALTER TABLE ONLY public.brand_domain_reviews
     ADD CONSTRAINT brand_domain_reviews_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brand_domains brand_domains_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_domains
+    ADD CONSTRAINT brand_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brand_redeemable_domains brand_redeemable_domains_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_redeemable_domains
+    ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
 
 
 --

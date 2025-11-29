@@ -3,6 +3,7 @@ import { getDb } from "./db.ts";
 
 type Env = {
   DATABASE_URL: string;
+  EXTENSION_API_KEY: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -15,6 +16,20 @@ function variantToLabel(variant: string | null | undefined): string | null {
 }
 
 app.get("/health", (c) => c.text("ok"));
+
+// Simple API key protection for extension traffic. If EXTENSION_API_KEY is
+// configured in the Worker environment, require matching X-Extension-Key.
+app.use("/offers", async (c, next) => {
+  const expected = c.env.EXTENSION_API_KEY;
+  if (!expected) {
+    return c.json({ error: "Server misconfigured: missing EXTENSION_API_KEY" }, 500);
+  }
+  const provided = c.req.header("x-extension-key") || "";
+  if (provided !== expected) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  return next();
+});
 
 // GET /offers?domain=bestbuy.com[&in_store=true|false]
 // Returns all provider offers for the brand matching the given base domain,
@@ -34,7 +49,51 @@ app.get("/offers", async (c) => {
 
   const inStoreParam = c.req.query("in_store");
 
-  // Look up offers via the materialized view, restricted to active brands
+  // Step 1: resolve the canonical brand for this hostname.
+  // Prefer an explicit mapping in brand_domains; if none exists, fall back
+  // to matching brands by base_domain.
+  let canonicalBrandRows = await sql/* sql */ `
+    select
+      b.id,
+      b.name,
+      b.slug,
+      b.base_domain
+    from brand_domains bd
+    join brands b on b.id = bd.brand_id
+    where lower(bd.domain) = lower(${domain})
+      and b.status = 'active'
+    limit 1
+  `;
+
+  if (!canonicalBrandRows.length) {
+    canonicalBrandRows = await sql/* sql */ `
+      select
+        b.id,
+        b.name,
+        b.slug,
+        b.base_domain
+      from brands b
+      where lower(b.base_domain) = lower(${domain})
+        and b.status = 'active'
+      order by b.created_at
+      limit 1
+    `;
+  }
+
+  if (!canonicalBrandRows.length || !canonicalBrandRows[0]?.base_domain) {
+    return c.json({
+      brand: null,
+      bestOffer: null,
+      offers: [],
+    });
+  }
+
+  const canonicalBrand = canonicalBrandRows[0] as any;
+  const baseDomain = canonicalBrand.base_domain as string;
+
+  // Step 2: look up offers for:
+  //   - all brands that share this base_domain (brand family, e.g. Gap + Baby Gap)
+  //   - plus any brands whose gift cards are redeemable on this hostname
   const rows = await sql/* sql */ `
     select
       v.brand_id,
@@ -51,8 +110,16 @@ app.get("/offers", async (c) => {
       v.variant
     from v_brand_provider_offers v
     join brands b on b.id = v.brand_id
-    where lower(b.base_domain) = lower(${domain})
-      and b.status = 'active'
+    where b.status = 'active'
+      and (
+        lower(b.base_domain) = lower(${baseDomain})
+        or exists (
+          select 1
+          from brand_redeemable_domains brd
+          where brd.brand_id = b.id
+            and lower(brd.domain) = lower(${domain})
+        )
+      )
     order by
       v.in_stock desc,
       v.max_discount_percent desc nulls last,
@@ -67,13 +134,11 @@ app.get("/offers", async (c) => {
     });
   }
 
-  const first = rows[0] as any;
-
   const brand = {
-    id: first.brand_id as string,
-    name: first.brand_name as string,
-    slug: first.brand_slug as string,
-    base_domain: first.base_domain as string | null,
+    id: canonicalBrand.id as string,
+    name: canonicalBrand.name as string,
+    slug: canonicalBrand.slug as string,
+    base_domain: (canonicalBrand.base_domain as string | null) ?? null,
   };
 
   const offers = rows.map((r: any) => {
