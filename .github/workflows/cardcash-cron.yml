@@ -32,6 +32,6 @@ jobs:
       - name: Run CardCash cron (fetch + DB update)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LINKSYNERGY_SITE_ID: ${{ secrets.LINKSYNERGY_SITE_ID }}
+          CARDCASH_ADVERTISER_ID: ${{ secrets.CARDCASH_ADVERTISER_ID }}
         run: pnpm cron:cardcash
-
-
