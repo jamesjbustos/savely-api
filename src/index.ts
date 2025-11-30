@@ -176,7 +176,12 @@ app.get("/offers", async (c) => {
 
   // Filter to only offers that are both in stock and have a usable URL.
   const clickableOffers = filteredOffers.filter(
-    (o) => o.in_stock && typeof o.product_url === "string" && o.product_url
+    (o) =>
+      o.in_stock &&
+      typeof o.product_url === "string" &&
+      o.product_url &&
+      o.max_discount_percent != null &&
+      o.max_discount_percent > 0
   );
 
   // Best offer: first in-stock row by discount, with a non-empty URL

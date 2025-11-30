@@ -116,7 +116,7 @@ begin
       last_seen_at = greatest(dest.last_seen_at, src.last_seen_at),
       last_checked_at = greatest(dest.last_checked_at, src.last_checked_at),
       product_url = coalesce(src.product_url, dest.product_url),
-      card_image_url = null
+      discount_percent = coalesce(src.discount_percent, dest.discount_percent)
   from provider_brand_products src
   where src.brand_id = discard_id
     and dest.provider_id = src.provider_id
@@ -125,10 +125,10 @@ begin
     and coalesce(dest.product_external_id, '') = coalesce(src.product_external_id, '');
 
   insert into provider_brand_products
-    (provider_id, brand_id, variant, product_external_id, product_url, is_active,
-     first_seen_at, last_seen_at, last_checked_at, last_status, last_error, retry_count, card_image_url)
-  select src.provider_id, keep_id, src.variant, src.product_external_id, src.product_url, src.is_active,
-         src.first_seen_at, src.last_seen_at, src.last_checked_at, src.last_status, src.last_error, src.retry_count, null
+    (provider_id, brand_id, variant, product_external_id, product_url, discount_percent, is_active,
+     first_seen_at, last_seen_at, last_checked_at, last_status, last_error, retry_count)
+  select src.provider_id, keep_id, src.variant, src.product_external_id, src.product_url, src.discount_percent, src.is_active,
+         src.first_seen_at, src.last_seen_at, src.last_checked_at, src.last_status, src.last_error, src.retry_count
   from provider_brand_products src
   where src.brand_id = discard_id
     and not exists (
@@ -145,7 +145,7 @@ begin
   set brand_id = keep_id
   where brand_id = discard_id;
 
-  -- Finally, remove the old brand (cascades its remaining aliases)
+  -- Finally, remove the old brand (cascades its remaining aliases/products)
   delete from brands
   where id = discard_id;
 end;
@@ -336,6 +336,7 @@ CREATE TABLE public.provider_brand_products (
     variant text NOT NULL,
     product_external_id text,
     product_url text NOT NULL,
+    discount_percent numeric(5,2),
     is_active boolean DEFAULT true NOT NULL,
     first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     last_seen_at timestamp with time zone,
@@ -372,7 +373,7 @@ ALTER TABLE public.providers OWNER TO neondb_owner;
 -- Name: v_brand_provider_offers; Type: VIEW; Schema: public; Owner: neondb_owner
 --
 
-CREATE VIEW public.v_brand_provider_offers AS
+ CREATE VIEW public.v_brand_provider_offers AS
  SELECT b.id AS brand_id,
     b.name AS brand_name,
     b.slug AS brand_slug,
@@ -380,8 +381,8 @@ CREATE VIEW public.v_brand_provider_offers AS
     p.id AS provider_id,
     p.name AS provider_name,
     p.slug AS provider_slug,
-    pbd.max_discount_percent,
-    pbd.in_stock,
+    COALESCE(pbp.discount_percent, pbd.max_discount_percent) AS max_discount_percent,
+    COALESCE(pbp.is_active, pbd.in_stock) AS in_stock,
     pbd.fetched_at,
     pbp.product_url,
     pbp.variant
@@ -733,4 +734,3 @@ REVOKE USAGE ON SCHEMA public FROM PUBLIC;
 --
 -- PostgreSQL database dump complete
 --
-

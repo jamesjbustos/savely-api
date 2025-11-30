@@ -655,6 +655,26 @@ export async function runGcxCron(env: CronEnv) {
       });
     }
 
+    const nowTs = new Date().toISOString();
+
+    // Pessimistically mark all GCX discounts/products as inactive. We'll
+    // selectively flip entries back to active based on the latest GCX data
+    // so we don't keep serving stale 0% offers.
+    await sql/* sql */ `
+      update provider_brand_discounts
+      set in_stock = false,
+          max_discount_percent = 0,
+          fetched_at = ${nowTs}
+      where provider_id = ${providerId}
+    `;
+
+    await sql/* sql */ `
+      update provider_brand_products
+      set is_active = false,
+          last_checked_at = ${nowTs}
+      where provider_id = ${providerId}
+    `;
+
     // Fetch CardBear discounts once as a trigger for GCX
     let discounts: any[] = [];
     try {
@@ -677,8 +697,6 @@ export async function runGcxCron(env: CronEnv) {
       );
       return;
     }
-
-    const nowTs = new Date().toISOString();
 
     // Cache GCX responses per slug to avoid duplicate hits
     const gcxCache = new Map<string, any>();
