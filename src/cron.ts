@@ -466,6 +466,7 @@ export async function runCardCookieCron(env: CronEnv) {
   await sql/* sql */ `
     update provider_brand_discounts
     set in_stock = false,
+        max_discount_percent = 0,
         fetched_at = ${nowTs}
     where provider_id = ${providerId}
   `;

@@ -17,6 +17,59 @@ function variantToLabel(variant: string | null | undefined): string | null {
 
 app.get("/health", (c) => c.text("ok"));
 
+// GET /popular-brands?window_hours=24&limit=20
+// Returns brands ordered by how many relevant events they had
+// in the last N hours (default 24), based on brand_events.
+app.get("/popular-brands", async (c) => {
+  const sql = getDb(c.env);
+
+  const windowParam = c.req.query("window_hours") || "24";
+  const limitParam = c.req.query("limit") || "20";
+
+  const windowHoursRaw = Number.parseInt(windowParam, 10);
+  const limitRaw = Number.parseInt(limitParam, 10);
+
+  const windowHours = Number.isFinite(windowHoursRaw)
+    ? Math.min(Math.max(windowHoursRaw, 1), 168)
+    : 24;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.min(Math.max(limitRaw, 1), 100)
+    : 20;
+
+  const rows = await sql/* sql */ `
+    select
+      b.id as brand_id,
+      b.name,
+      b.slug,
+      b.base_domain,
+      count(*) as event_count
+    from brand_events e
+    join brands b on b.id = e.brand_id
+    where e.event_type = 'offer_view'
+      and e.created_at >= now() - (${windowHours} * interval '1 hour')
+    group by b.id, b.name, b.slug, b.base_domain
+    order by event_count desc
+    limit ${limit}
+  `;
+
+  const brands = (rows as any[]).map((r) => ({
+    id: r.brand_id as string,
+    name: r.name as string,
+    slug: r.slug as string,
+    base_domain: (r.base_domain as string | null) ?? null,
+    event_count:
+      typeof r.event_count === "number"
+        ? r.event_count
+        : Number(r.event_count),
+  }));
+
+  return c.json({
+    window_hours: windowHours,
+    limit,
+    brands,
+  });
+});
+
 // Simple API key protection for extension traffic. If EXTENSION_API_KEY is
 // configured in the Worker environment, require matching X-Extension-Key.
 app.use("/offers", async (c, next) => {
@@ -90,6 +143,31 @@ app.get("/offers", async (c) => {
 
   const canonicalBrand = canonicalBrandRows[0] as any;
   const baseDomain = canonicalBrand.base_domain as string;
+
+  // Fire-and-forget analytics event for extension traffic hitting a known brand.
+  // Only log when the domain maps to a brand in our DB.
+  try {
+    const logPromise = sql/* sql */ `
+      insert into brand_events (brand_id, event_type, source, domain, path)
+      values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain}, ${null})
+    `;
+    // In Workers, prefer background logging so we don't block the response.
+    // Hono exposes the execution context as c.executionCtx.
+    // If unavailable (e.g., in tests), just await the insert.
+    // @ts-ignore - executionCtx is provided by the Cloudflare runtime
+    const executionCtx = (c as any).executionCtx;
+    if (executionCtx && typeof executionCtx.waitUntil === "function") {
+      executionCtx.waitUntil(
+        logPromise.catch((err: unknown) => {
+          console.error("Failed to log brand_events entry:", err);
+        })
+      );
+    } else {
+      await logPromise;
+    }
+  } catch (err) {
+    console.error("Error scheduling brand_events logging:", err);
+  }
 
   // Step 2: look up offers for:
   //   - all brands that share this base_domain (brand family, e.g. Gap + Baby Gap)

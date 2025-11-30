@@ -103,7 +103,13 @@ begin
   from provider_brand_discounts
   where brand_id = discard_id
   on conflict (provider_id, brand_id) do update
-  set max_discount_percent = greatest(provider_brand_discounts.max_discount_percent, excluded.max_discount_percent),
+  set max_discount_percent = case
+        when excluded.in_stock and not provider_brand_discounts.in_stock
+          then excluded.max_discount_percent
+        when provider_brand_discounts.in_stock and not excluded.in_stock
+          then provider_brand_discounts.max_discount_percent
+        else greatest(provider_brand_discounts.max_discount_percent, excluded.max_discount_percent)
+      end,
       in_stock = provider_brand_discounts.in_stock or excluded.in_stock,
       fetched_at = greatest(provider_brand_discounts.fetched_at, excluded.fetched_at);
 
@@ -115,8 +121,7 @@ begin
   set is_active = dest.is_active or src.is_active,
       last_seen_at = greatest(dest.last_seen_at, src.last_seen_at),
       last_checked_at = greatest(dest.last_checked_at, src.last_checked_at),
-      product_url = coalesce(src.product_url, dest.product_url),
-      discount_percent = coalesce(src.discount_percent, dest.discount_percent)
+      product_url = coalesce(src.product_url, dest.product_url)
   from provider_brand_products src
   where src.brand_id = discard_id
     and dest.provider_id = src.provider_id
@@ -125,9 +130,9 @@ begin
     and coalesce(dest.product_external_id, '') = coalesce(src.product_external_id, '');
 
   insert into provider_brand_products
-    (provider_id, brand_id, variant, product_external_id, product_url, discount_percent, is_active,
+    (provider_id, brand_id, variant, product_external_id, product_url, is_active,
      first_seen_at, last_seen_at, last_checked_at, last_status, last_error, retry_count)
-  select src.provider_id, keep_id, src.variant, src.product_external_id, src.product_url, src.discount_percent, src.is_active,
+  select src.provider_id, keep_id, src.variant, src.product_external_id, src.product_url, src.is_active,
          src.first_seen_at, src.last_seen_at, src.last_checked_at, src.last_status, src.last_error, src.retry_count
   from provider_brand_products src
   where src.brand_id = discard_id
@@ -157,6 +162,23 @@ ALTER FUNCTION public.merge_brands(keep_id uuid, discard_id uuid) OWNER TO neond
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
+
+--
+-- Name: brand_events; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    event_type text NOT NULL,
+    source text NOT NULL,
+    domain public.citext,
+    path text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.brand_events OWNER TO neondb_owner;
 
 --
 -- Name: brand_aliases; Type: TABLE; Schema: public; Owner: neondb_owner
@@ -336,7 +358,6 @@ CREATE TABLE public.provider_brand_products (
     variant text NOT NULL,
     product_external_id text,
     product_url text NOT NULL,
-    discount_percent numeric(5,2),
     is_active boolean DEFAULT true NOT NULL,
     first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
     last_seen_at timestamp with time zone,
@@ -344,6 +365,7 @@ CREATE TABLE public.provider_brand_products (
     last_status text,
     last_error text,
     retry_count integer DEFAULT 0 NOT NULL,
+    discount_percent numeric(5,2),
     CONSTRAINT chk_pbp_variant CHECK ((variant = ANY (ARRAY['online'::text, 'in_store'::text, 'other'::text])))
 );
 
@@ -373,7 +395,7 @@ ALTER TABLE public.providers OWNER TO neondb_owner;
 -- Name: v_brand_provider_offers; Type: VIEW; Schema: public; Owner: neondb_owner
 --
 
- CREATE VIEW public.v_brand_provider_offers AS
+CREATE VIEW public.v_brand_provider_offers AS
  SELECT b.id AS brand_id,
     b.name AS brand_name,
     b.slug AS brand_slug,
@@ -491,6 +513,14 @@ ALTER TABLE ONLY public.provider_brand_products
 
 
 --
+-- Name: brand_events brand_events_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_events
+    ADD CONSTRAINT brand_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: providers providers_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -511,6 +541,20 @@ ALTER TABLE ONLY public.providers
 --
 
 CREATE INDEX idx_brand_redeemable_by_domain ON public.brand_redeemable_domains USING btree (lower((domain)::text));
+
+
+--
+-- Name: idx_brand_events_brand_time; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_events_brand_time ON public.brand_events USING btree (brand_id, created_at DESC);
+
+
+--
+-- Name: idx_brand_events_created_at; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_events_created_at ON public.brand_events USING btree (created_at DESC);
 
 
 --
@@ -650,6 +694,14 @@ ALTER TABLE ONLY public.brand_domains
 
 ALTER TABLE ONLY public.brand_redeemable_domains
     ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brand_events brand_events_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_events
+    ADD CONSTRAINT brand_events_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
 
 
 --
