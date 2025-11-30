@@ -348,7 +348,9 @@ async function main() {
       }
     }
 
-    // Upsert discount snapshot
+    // Upsert discount snapshot at brand level so non-product-aware
+    // consumers can still see the "best" discount. Per-product discounts
+    // are stored on provider_brand_products.discount_percent.
     await sql/* sql */ `
       insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
       values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
@@ -366,9 +368,9 @@ async function main() {
 
     await sql/* sql */ `
       insert into provider_brand_products
-        (provider_id, brand_id, variant, product_external_id, product_url, is_active, last_seen_at, last_checked_at)
+        (provider_id, brand_id, variant, product_external_id, product_url, discount_percent, is_active, last_seen_at, last_checked_at)
       values
-        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${inStock}, ${nowTs}, ${nowTs})
+        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${maxDiscountPercent}, ${inStock}, ${nowTs}, ${nowTs})
       on conflict do nothing
     `;
     await sql/* sql */ `
@@ -377,7 +379,8 @@ async function main() {
         is_active = ${inStock},
         last_seen_at = ${nowTs},
         last_checked_at = ${nowTs},
-        product_url = ${productUrl}
+        product_url = ${productUrl},
+        discount_percent = ${maxDiscountPercent}
       where provider_id = ${providerId}
         and brand_id = ${brandId}
         and variant = ${variant}
