@@ -147,26 +147,12 @@ app.get("/offers", async (c) => {
   // Fire-and-forget analytics event for extension traffic hitting a known brand.
   // Only log when the domain maps to a brand in our DB.
   try {
-    const logPromise = sql/* sql */ `
-      insert into brand_events (brand_id, event_type, source, domain, path)
-      values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain}, ${null})
+    await sql/* sql */ `
+      insert into brand_events (brand_id, event_type, source, domain)
+      values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain})
     `;
-    // In Workers, prefer background logging so we don't block the response.
-    // Hono exposes the execution context as c.executionCtx.
-    // If unavailable (e.g., in tests), just await the insert.
-    // @ts-ignore - executionCtx is provided by the Cloudflare runtime
-    const executionCtx = (c as any).executionCtx;
-    if (executionCtx && typeof executionCtx.waitUntil === "function") {
-      executionCtx.waitUntil(
-        logPromise.catch((err: unknown) => {
-          console.error("Failed to log brand_events entry:", err);
-        })
-      );
-    } else {
-      await logPromise;
-    }
   } catch (err) {
-    console.error("Error scheduling brand_events logging:", err);
+    console.error("Error logging brand_events entry:", err);
   }
 
   // Step 2: look up offers for:
