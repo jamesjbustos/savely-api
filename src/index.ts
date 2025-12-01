@@ -8,6 +8,17 @@ type Env = {
 
 const app = new Hono<{ Bindings: Env }>();
 
+const OFFERS_CACHE_TTL_MS = 30_000;
+
+function getOffersCache() {
+  const globalCaches = (globalThis as any).caches;
+  if (!globalCaches || !globalCaches.default) return null;
+  return globalCaches.default as {
+    match(request: Request): Promise<Response | undefined>;
+    put(request: Request, response: Response): Promise<void>;
+  };
+}
+
 function variantToLabel(variant: string | null | undefined): string | null {
   if (!variant) return null;
   if (variant === "online") return "Online";
@@ -98,6 +109,24 @@ app.get("/offers", async (c) => {
     return c.json({ error: "Missing required query param: domain" }, 400);
   }
 
+  const cache = getOffersCache();
+  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
+
+  if (cache && cacheKey) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
+      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
+      if (
+        Number.isFinite(cachedAt) &&
+        cachedAt > 0 &&
+        Date.now() - cachedAt < OFFERS_CACHE_TTL_MS
+      ) {
+        return cached;
+      }
+    }
+  }
+
   const sql = getDb(c.env);
 
   const inStoreParam = c.req.query("in_store");
@@ -146,13 +175,21 @@ app.get("/offers", async (c) => {
 
   // Fire-and-forget analytics event for extension traffic hitting a known brand.
   // Only log when the domain maps to a brand in our DB.
-  try {
-    await sql/* sql */ `
-      insert into brand_events (brand_id, event_type, source, domain)
-      values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain})
-    `;
-  } catch (err) {
-    console.error("Error logging brand_events entry:", err);
+  const logBrandEvent = async () => {
+    try {
+      await sql/* sql */ `
+        insert into brand_events (brand_id, event_type, source, domain)
+        values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain})
+      `;
+    } catch (err) {
+      console.error("Error logging brand_events entry:", err);
+    }
+  };
+
+  if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
+    c.executionCtx.waitUntil(logBrandEvent());
+  } else {
+    await logBrandEvent();
   }
 
   // Step 2: look up offers for:
@@ -252,11 +289,26 @@ app.get("/offers", async (c) => {
   // (thanks to SQL ordering, clickableOffers[0] is the best).
   const bestOffer = clickableOffers[0] || null;
 
-  return c.json({
+  const response = c.json({
     brand,
     bestOffer,
     offers: clickableOffers,
   });
+
+  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
+    response.headers.set("X-Savely-Cache-At", String(Date.now()));
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          await cache.put(cacheKey, response.clone());
+        } catch (err) {
+          console.error("Error caching /offers response:", err);
+        }
+      })()
+    );
+  }
+
+  return response;
 });
 
 export default {
