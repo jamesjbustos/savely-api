@@ -29,5 +29,4 @@ jobs:
       - name: Run ArbitrageCard cron
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: pnpm ts-node --esm scripts/run-arbitrage-cron.ts
-
+        run: pnpm exec tsx scripts/run-arbitrage-cron.ts
