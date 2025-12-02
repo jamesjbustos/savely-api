@@ -9,6 +9,7 @@ type Env = {
 const app = new Hono<{ Bindings: Env }>();
 
 const OFFERS_CACHE_TTL_MS = 30_000;
+const OFFERS_CLIENT_TTL_SECONDS = 30;
 
 function getOffersCache() {
   const globalCaches = (globalThis as any).caches;
@@ -29,8 +30,9 @@ function variantToLabel(variant: string | null | undefined): string | null {
 app.get("/health", (c) => c.text("ok"));
 
 // GET /popular-brands?window_hours=24&limit=20
-// Returns brands ordered by how many relevant events they had
-// in the last N hours (default 24), based on brand_events.
+// Returns brands ordered by how many unique viewers they had
+// in the last N hours (default 24), based on brand_daily_viewers
+// when available, falling back to brand_events for legacy traffic.
 app.get("/popular-brands", async (c) => {
   const sql = getDb(c.env);
 
@@ -47,7 +49,23 @@ app.get("/popular-brands", async (c) => {
     ? Math.min(Math.max(limitRaw, 1), 100)
     : 20;
 
-  const rows = await sql/* sql */ `
+  let rows = await sql/* sql */ `
+    select
+      b.id as brand_id,
+      b.name,
+      b.slug,
+      b.base_domain,
+      count(*) as event_count
+    from brand_daily_viewers v
+    join brands b on b.id = v.brand_id
+    where v.created_at >= now() - (${windowHours} * interval '1 hour')
+    group by b.id, b.name, b.slug, b.base_domain
+    order by event_count desc
+    limit ${limit}
+  `;
+
+  if (!(rows as any[]).length) {
+    rows = await sql/* sql */ `
     select
       b.id as brand_id,
       b.name,
@@ -62,6 +80,7 @@ app.get("/popular-brands", async (c) => {
     order by event_count desc
     limit ${limit}
   `;
+  }
 
   const brands = (rows as any[]).map((r) => ({
     id: r.brand_id as string,
@@ -94,6 +113,60 @@ app.use("/offers", async (c, next) => {
     return c.json({ error: "Unauthorized" }, 401);
   }
   return next();
+});
+
+app.use("/brand-domains", async (c, next) => {
+  const expected = c.env.EXTENSION_API_KEY;
+  if (!expected) {
+    return c.json(
+      { error: "Server misconfigured: missing EXTENSION_API_KEY" },
+      500
+    );
+  }
+  const provided = c.req.header("x-extension-key") || "";
+  if (provided !== expected) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  return next();
+});
+
+// GET /brand-domains
+// Returns a list of domains where the extension should call /offers.
+// This is used by the extension to pre-filter which pages are eligible
+// for offer lookups, and is safe to cache for a long time.
+app.get("/brand-domains", async (c) => {
+  const sql = getDb(c.env);
+
+  const rows = await sql/* sql */ `
+    select distinct lower(d) as domain
+    from (
+      select base_domain::text as d
+      from brands
+      where base_domain is not null
+        and status = 'active'
+
+      union
+
+      select bd.domain::text as d
+      from brand_domains bd
+      join brands b on b.id = bd.brand_id
+      where b.status = 'active'
+
+      union
+
+      select brd.domain::text as d
+      from brand_redeemable_domains brd
+      join brands b on b.id = brd.brand_id
+      where b.status = 'active'
+    ) all_domains
+    order by domain
+  `;
+
+  const domains = (rows as any[]).map((r) => r.domain as string);
+
+  c.header("Cache-Control", "public, max-age=86400");
+
+  return c.json({ domains });
 });
 
 // GET /offers?domain=bestbuy.com[&in_store=true|false]
@@ -164,28 +237,38 @@ app.get("/offers", async (c) => {
   }
 
   if (!canonicalBrandRows.length || !canonicalBrandRows[0]?.base_domain) {
-    return c.json({
-      brand: null,
-      bestOffer: null,
-      offers: [],
-    });
+    return c.json(
+      {
+        error: "Unsupported domain",
+        brand: null,
+        bestOffer: null,
+        offers: [],
+      },
+      422
+    );
   }
 
   const canonicalBrand = canonicalBrandRows[0] as any;
   const baseDomain = canonicalBrand.base_domain as string;
 
-  // Fire-and-forget analytics event for extension traffic hitting a known brand.
-  // Only log when the domain maps to a brand in our DB.
+  const viewerIdHeader = c.req.header("x-viewer-id");
+  const viewerId =
+    typeof viewerIdHeader === "string" && viewerIdHeader.trim()
+      ? viewerIdHeader.trim()
+      : null;
+
+  // Fire-and-forget analytics for extension traffic hitting a known brand.
+  // Only log unique daily viewers when a viewer_id is provided.
   const logBrandEvent = async () => {
+    if (!viewerId) return;
     try {
       await sql/* sql */ `
-        insert into brand_events (brand_id, event_type, source, domain)
-        values (${
-          canonicalBrand.id
-        }, ${"offer_view"}, ${"extension"}, ${domain})
+        insert into brand_daily_viewers (brand_id, viewer_id, day)
+        values (${canonicalBrand.id}, ${viewerId}, current_date)
+        on conflict (brand_id, viewer_id, day) do nothing
       `;
     } catch (err) {
-      console.error("Error logging brand_events entry:", err);
+      console.error("Error logging brand_daily_viewers entry:", err);
     }
   };
 
@@ -297,6 +380,11 @@ app.get("/offers", async (c) => {
     bestOffer,
     offers: clickableOffers,
   });
+
+  response.headers.set(
+    "X-Savely-Offers-TTL-Seconds",
+    String(OFFERS_CLIENT_TTL_SECONDS)
+  );
 
   if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
     response.headers.set("X-Savely-Cache-At", String(Date.now()));

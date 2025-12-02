@@ -177,6 +177,21 @@ CREATE TABLE public.brand_aliases (
 ALTER TABLE public.brand_aliases OWNER TO neondb_owner;
 
 --
+-- Name: brand_daily_viewers; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_daily_viewers (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    viewer_id text NOT NULL,
+    day date NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.brand_daily_viewers OWNER TO neondb_owner;
+
+--
 -- Name: brand_domain_candidates; Type: TABLE; Schema: public; Owner: neondb_owner
 --
 
@@ -536,6 +551,13 @@ ALTER TABLE ONLY public.providers
 
 
 --
+-- Name: idx_brand_daily_viewers_brand_day; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_daily_viewers_brand_day ON public.brand_daily_viewers USING btree (brand_id, day);
+
+
+--
 -- Name: idx_brand_events_brand_time; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -589,6 +611,13 @@ CREATE INDEX idx_pbl_brand_provider_fetched ON public.provider_brand_listings US
 --
 
 CREATE UNIQUE INDEX uq_brand_alias_per_brand ON public.brand_aliases USING btree (brand_id, lower(alias));
+
+
+--
+-- Name: uq_brand_daily_viewers_unique; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE UNIQUE INDEX uq_brand_daily_viewers_unique ON public.brand_daily_viewers USING btree (brand_id, viewer_id, day);
 
 
 --
