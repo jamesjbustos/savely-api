@@ -63,6 +63,10 @@ export async function runCardCenterCron(env: CronEnv) {
   console.log(`CardCenter cron: fetched ${items.length} brands from API`);
 
   const nowTs = new Date().toISOString();
+  const brandDiscounts = new Map<
+    string,
+    { maxDiscount: number; inStock: boolean }
+  >();
 
   // 1) Pessimistically mark everything as out of stock / inactive
   await sql/* sql */ `
@@ -104,8 +108,6 @@ export async function runCardCenterCron(env: CronEnv) {
       continue;
     }
 
-    const maxDiscountPercent = Math.max(0, high * 100);
-
     const variant = "online";
 
     // Prefer existing brand strictly by external id; only create a new
@@ -145,15 +147,15 @@ export async function runCardCenterCron(env: CronEnv) {
 
     const inStock = true; // items with discounts are treated as available
 
-    await sql/* sql */ `
-      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
-      values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
-      on conflict (provider_id, brand_id)
-      do update set
-        max_discount_percent = excluded.max_discount_percent,
-        in_stock = excluded.in_stock,
-        fetched_at = excluded.fetched_at
-    `;
+    const maxDiscountPercent = Math.max(0, high * 100);
+    const prev = brandDiscounts.get(brandId) ?? {
+      maxDiscount: 0,
+      inStock: false,
+    };
+    brandDiscounts.set(brandId, {
+      maxDiscount: Math.max(prev.maxDiscount, maxDiscountPercent),
+      inStock: prev.inStock || inStock,
+    });
 
     const productUrl = `https://cardcenter.cc/shop/gift-cards/${providerBrandSlug}`;
 
@@ -187,6 +189,18 @@ export async function runCardCenterCron(env: CronEnv) {
     updated += 1;
   }
 
+  for (const [brandId, agg] of brandDiscounts.entries()) {
+    await sql/* sql */ `
+      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+      values (${providerId}, ${brandId}, ${agg.maxDiscount}, ${agg.inStock}, ${nowTs})
+      on conflict (provider_id, brand_id)
+      do update set
+        max_discount_percent = excluded.max_discount_percent,
+        in_stock = excluded.in_stock,
+        fetched_at = excluded.fetched_at
+    `;
+  }
+
   // 3) Append a snapshot of the current state into history
   await sql/* sql */ `
     insert into provider_brand_discount_history (
@@ -197,13 +211,28 @@ export async function runCardCenterCron(env: CronEnv) {
       observed_at
     )
     select
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      fetched_at
-    from provider_brand_discounts
-    where provider_id = ${providerId}
+      pbd.provider_id,
+      pbd.brand_id,
+      pbd.max_discount_percent,
+      pbd.in_stock,
+      pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select
+        max_discount_percent,
+        in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id
+        and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
   `;
 
   console.log(
@@ -270,6 +299,10 @@ export async function runCardDepotCron(env: CronEnv) {
   console.log(`CardDepot cron: fetched ${items.length} brands from API`);
 
   const nowTs = new Date().toISOString();
+  const brandDiscounts = new Map<
+    string,
+    { maxDiscount: number; inStock: boolean }
+  >();
 
   // 1) Pessimistically mark everything as out of stock / inactive
   await sql/* sql */ `
@@ -334,21 +367,17 @@ export async function runCardDepotCron(env: CronEnv) {
       }
     }
 
-    // CardDepot discount is already a percentage value
-    const maxDiscountPercent = Math.max(0, discount);
-
     const utmCampaign = encodeURIComponent(q || title || slug);
     const productUrl = `https://carddepot.com/brands/${slug}?utm_source=savely&utm_medium=partner&utm_campaign=${utmCampaign}`;
-
-    await sql/* sql */ `
-      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
-      values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${isStock}, ${nowTs})
-      on conflict (provider_id, brand_id)
-      do update set
-        max_discount_percent = excluded.max_discount_percent,
-        in_stock = excluded.in_stock,
-        fetched_at = excluded.fetched_at
-    `;
+    const maxDiscountPercent = Math.max(0, discount);
+    const prev = brandDiscounts.get(brandId) ?? {
+      maxDiscount: 0,
+      inStock: false,
+    };
+    brandDiscounts.set(brandId, {
+      maxDiscount: Math.max(prev.maxDiscount, maxDiscountPercent),
+      inStock: prev.inStock || isStock,
+    });
 
     // Use the title-based heuristics to decide variant
     const variant = mapVariantFromStrings(title, title);
@@ -382,6 +411,18 @@ export async function runCardDepotCron(env: CronEnv) {
     updated += 1;
   }
 
+  for (const [brandId, agg] of brandDiscounts.entries()) {
+    await sql/* sql */ `
+      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+      values (${providerId}, ${brandId}, ${agg.maxDiscount}, ${agg.inStock}, ${nowTs})
+      on conflict (provider_id, brand_id)
+      do update set
+        max_discount_percent = excluded.max_discount_percent,
+        in_stock = excluded.in_stock,
+        fetched_at = excluded.fetched_at
+    `;
+  }
+
   // 3) Append a snapshot of the current state into history
   await sql/* sql */ `
     insert into provider_brand_discount_history (
@@ -392,13 +433,28 @@ export async function runCardDepotCron(env: CronEnv) {
       observed_at
     )
     select
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      fetched_at
-    from provider_brand_discounts
-    where provider_id = ${providerId}
+      pbd.provider_id,
+      pbd.brand_id,
+      pbd.max_discount_percent,
+      pbd.in_stock,
+      pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select
+        max_discount_percent,
+        in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id
+        and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
   `;
 
   console.log(
@@ -458,6 +514,10 @@ export async function runCardCookieCron(env: CronEnv) {
   const $ = loadHtml(html);
 
   const nowTs = new Date().toISOString();
+  const brandDiscounts = new Map<
+    string,
+    { maxDiscount: number; inStock: boolean }
+  >();
 
   const anchors = $(".gift-card-grid a.giftCard-link");
   console.log(`CardCookie cron: found ${anchors.length} items on homepage`);
@@ -547,16 +607,14 @@ export async function runCardCookieCron(env: CronEnv) {
       }
     }
 
-    // Upsert discounts
-    await sql/* sql */ `
-      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
-      values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
-      on conflict (provider_id, brand_id)
-      do update set
-        max_discount_percent = excluded.max_discount_percent,
-        in_stock = excluded.in_stock,
-        fetched_at = excluded.fetched_at
-    `;
+    const prev = brandDiscounts.get(brandId) ?? {
+      maxDiscount: 0,
+      inStock: false,
+    };
+    brandDiscounts.set(brandId, {
+      maxDiscount: Math.max(prev.maxDiscount, maxDiscountPercent),
+      inStock: prev.inStock || inStock,
+    });
 
     // Upsert product row (external id = CardCookie slug)
     await sql/* sql */ `
@@ -591,6 +649,18 @@ export async function runCardCookieCron(env: CronEnv) {
 
   console.log(`CardCookie cron: processed ${processed} items.`);
 
+  for (const [brandId, agg] of brandDiscounts.entries()) {
+    await sql/* sql */ `
+      insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+      values (${providerId}, ${brandId}, ${agg.maxDiscount}, ${agg.inStock}, ${nowTs})
+      on conflict (provider_id, brand_id)
+      do update set
+        max_discount_percent = excluded.max_discount_percent,
+        in_stock = excluded.in_stock,
+        fetched_at = excluded.fetched_at
+    `;
+  }
+
   // 3) Append a snapshot of the current state into history
   await sql/* sql */ `
     insert into provider_brand_discount_history (
@@ -601,13 +671,28 @@ export async function runCardCookieCron(env: CronEnv) {
       observed_at
     )
     select
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      fetched_at
-    from provider_brand_discounts
-    where provider_id = ${providerId}
+      pbd.provider_id,
+      pbd.brand_id,
+      pbd.max_discount_percent,
+      pbd.in_stock,
+      pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select
+        max_discount_percent,
+        in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id
+        and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
   `;
 }
 
@@ -703,6 +788,10 @@ export async function runGcxCron(env: CronEnv) {
     const gcxCache = new Map<string, any>();
 
     let updated = 0;
+    const brandDiscounts = new Map<
+      string,
+      { maxDiscount: number; inStock: boolean }
+    >();
 
     // Optional safety cap on GCX subrequests per run; high enough that in
     // practice we cover all brands when running from GitHub Actions / Node.
@@ -781,16 +870,14 @@ export async function runGcxCron(env: CronEnv) {
 
       const maxDiscountPercent = Math.max(0, savings);
       const inStock = available;
-
-      await sql/* sql */ `
-        insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
-        values (${providerId}, ${brandId}, ${maxDiscountPercent}, ${inStock}, ${nowTs})
-        on conflict (provider_id, brand_id)
-        do update set
-          max_discount_percent = excluded.max_discount_percent,
-          in_stock = excluded.in_stock,
-          fetched_at = excluded.fetched_at
-      `;
+      const prev = brandDiscounts.get(brandId) ?? {
+        maxDiscount: 0,
+        inStock: false,
+      };
+      brandDiscounts.set(brandId, {
+        maxDiscount: Math.max(prev.maxDiscount, maxDiscountPercent),
+        inStock: prev.inStock || inStock,
+      });
 
       await sql/* sql */ `
         update provider_brand_products
@@ -805,6 +892,18 @@ export async function runGcxCron(env: CronEnv) {
       updated += 1;
     }
 
+    for (const [brandId, agg] of brandDiscounts.entries()) {
+      await sql/* sql */ `
+        insert into provider_brand_discounts (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+        values (${providerId}, ${brandId}, ${agg.maxDiscount}, ${agg.inStock}, ${nowTs})
+        on conflict (provider_id, brand_id)
+        do update set
+          max_discount_percent = excluded.max_discount_percent,
+          in_stock = excluded.in_stock,
+          fetched_at = excluded.fetched_at
+      `;
+    }
+
     // History snapshot for GCX
     await sql/* sql */ `
       insert into provider_brand_discount_history (
@@ -815,13 +914,28 @@ export async function runGcxCron(env: CronEnv) {
         observed_at
       )
       select
-        provider_id,
-        brand_id,
-        max_discount_percent,
-        in_stock,
-        fetched_at
-      from provider_brand_discounts
-      where provider_id = ${providerId}
+        pbd.provider_id,
+        pbd.brand_id,
+        pbd.max_discount_percent,
+        pbd.in_stock,
+        pbd.fetched_at
+      from provider_brand_discounts pbd
+      left join lateral (
+        select
+          max_discount_percent,
+          in_stock
+        from provider_brand_discount_history h
+        where h.provider_id = pbd.provider_id
+          and h.brand_id = pbd.brand_id
+        order by observed_at desc
+        limit 1
+      ) last on true
+      where pbd.provider_id = ${providerId}
+        and (
+          last.max_discount_percent is null
+          or last.max_discount_percent is distinct from pbd.max_discount_percent
+          or last.in_stock is distinct from pbd.in_stock
+        )
     `;
 
     console.log(
@@ -965,13 +1079,28 @@ export async function runArbitrageCron(env: CronEnv) {
       observed_at
     )
     select
-      provider_id,
-      brand_id,
-      max_discount_percent,
-      in_stock,
-      fetched_at
-    from provider_brand_discounts
-    where provider_id = ${providerId}
+      pbd.provider_id,
+      pbd.brand_id,
+      pbd.max_discount_percent,
+      pbd.in_stock,
+      pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select
+        max_discount_percent,
+        in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id
+        and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
   `;
 
   console.log(

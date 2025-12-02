@@ -69,9 +69,7 @@ app.get("/popular-brands", async (c) => {
     slug: r.slug as string,
     base_domain: (r.base_domain as string | null) ?? null,
     event_count:
-      typeof r.event_count === "number"
-        ? r.event_count
-        : Number(r.event_count),
+      typeof r.event_count === "number" ? r.event_count : Number(r.event_count),
   }));
 
   return c.json({
@@ -86,7 +84,10 @@ app.get("/popular-brands", async (c) => {
 app.use("/offers", async (c, next) => {
   const expected = c.env.EXTENSION_API_KEY;
   if (!expected) {
-    return c.json({ error: "Server misconfigured: missing EXTENSION_API_KEY" }, 500);
+    return c.json(
+      { error: "Server misconfigured: missing EXTENSION_API_KEY" },
+      500
+    );
   }
   const provided = c.req.header("x-extension-key") || "";
   if (provided !== expected) {
@@ -179,7 +180,9 @@ app.get("/offers", async (c) => {
     try {
       await sql/* sql */ `
         insert into brand_events (brand_id, event_type, source, domain)
-        values (${canonicalBrand.id}, ${"offer_view"}, ${"extension"}, ${domain})
+        values (${
+          canonicalBrand.id
+        }, ${"offer_view"}, ${"extension"}, ${domain})
       `;
     } catch (err) {
       console.error("Error logging brand_events entry:", err);

@@ -164,23 +164,6 @@ SET default_tablespace = '';
 SET default_table_access_method = heap;
 
 --
--- Name: brand_events; Type: TABLE; Schema: public; Owner: neondb_owner
---
-
-CREATE TABLE public.brand_events (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    brand_id uuid NOT NULL,
-    event_type text NOT NULL,
-    source text NOT NULL,
-    domain public.citext,
-    path text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
-ALTER TABLE public.brand_events OWNER TO neondb_owner;
-
---
 -- Name: brand_aliases; Type: TABLE; Schema: public; Owner: neondb_owner
 --
 
@@ -259,6 +242,22 @@ CREATE TABLE public.brand_domains (
 
 
 ALTER TABLE public.brand_domains OWNER TO neondb_owner;
+
+--
+-- Name: brand_events; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    event_type text NOT NULL,
+    source text NOT NULL,
+    domain public.citext,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.brand_events OWNER TO neondb_owner;
 
 --
 -- Name: brand_redeemable_domains; Type: TABLE; Schema: public; Owner: neondb_owner
@@ -457,6 +456,14 @@ ALTER TABLE ONLY public.brand_domains
 
 
 --
+-- Name: brand_events brand_events_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_events
+    ADD CONSTRAINT brand_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: brand_redeemable_domains brand_redeemable_domains_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -513,14 +520,6 @@ ALTER TABLE ONLY public.provider_brand_products
 
 
 --
--- Name: brand_events brand_events_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
---
-
-ALTER TABLE ONLY public.brand_events
-    ADD CONSTRAINT brand_events_pkey PRIMARY KEY (id);
-
-
---
 -- Name: providers providers_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -537,13 +536,6 @@ ALTER TABLE ONLY public.providers
 
 
 --
--- Name: idx_brand_redeemable_by_domain; Type: INDEX; Schema: public; Owner: neondb_owner
---
-
-CREATE INDEX idx_brand_redeemable_by_domain ON public.brand_redeemable_domains USING btree (lower((domain)::text));
-
-
---
 -- Name: idx_brand_events_brand_time; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -555,6 +547,13 @@ CREATE INDEX idx_brand_events_brand_time ON public.brand_events USING btree (bra
 --
 
 CREATE INDEX idx_brand_events_created_at ON public.brand_events USING btree (created_at DESC);
+
+
+--
+-- Name: idx_brand_redeemable_by_domain; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_redeemable_by_domain ON public.brand_redeemable_domains USING btree (lower((domain)::text));
 
 
 --
@@ -689,19 +688,19 @@ ALTER TABLE ONLY public.brand_domains
 
 
 --
--- Name: brand_redeemable_domains brand_redeemable_domains_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
---
-
-ALTER TABLE ONLY public.brand_redeemable_domains
-    ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
-
-
---
 -- Name: brand_events brand_events_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
 ALTER TABLE ONLY public.brand_events
     ADD CONSTRAINT brand_events_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brand_redeemable_domains brand_redeemable_domains_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_redeemable_domains
+    ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
 
 
 --
@@ -786,3 +785,4 @@ REVOKE USAGE ON SCHEMA public FROM PUBLIC;
 --
 -- PostgreSQL database dump complete
 --
+
