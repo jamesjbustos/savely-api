@@ -13,4 +13,10 @@
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"
   },
+  "ts-node": {
+    "compilerOptions": {
+      "module": "NodeNext",
+      "moduleResolution": "NodeNext"
+    }
+  }
 }
