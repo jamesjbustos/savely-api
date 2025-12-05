@@ -145,6 +145,10 @@ export async function runCardCenterCron(env: CronEnv) {
       }
     }
 
+    if (!brandId) continue;
+
+    if (!brandId) continue;
+
     const inStock = true; // items with discounts are treated as available
 
     const maxDiscountPercent = Math.max(0, high * 100);
@@ -366,6 +370,8 @@ export async function runCardDepotCron(env: CronEnv) {
         `;
       }
     }
+
+    if (!brandId) continue;
 
     const utmCampaign = encodeURIComponent(q || title || slug);
     const productUrl = `https://carddepot.com/brands/${slug}?utm_source=savely&utm_medium=partner&utm_campaign=${utmCampaign}`;
@@ -606,6 +612,8 @@ export async function runCardCookieCron(env: CronEnv) {
         `;
       }
     }
+
+    if (!brandId) continue;
 
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
@@ -1106,4 +1114,43 @@ export async function runArbitrageCron(env: CronEnv) {
   console.log(
     `Arbitrage cron: updated ${updated} brands; ${failures} domains reported as missing/errored.`
   );
+}
+
+export async function runOfferInventorySnapshotCron(env: CronEnv) {
+  const sql = getDb(env);
+
+  try {
+    const rows = await sql/* sql */ `
+      with snapshot_ts as (
+        select date_trunc('hour', now()) as snapshot_at
+      ),
+      provider_counts as (
+        select
+          p.id as provider_id,
+          count(v.provider_id) as live_offer_count
+        from providers p
+        left join v_brand_provider_offers v
+          on v.provider_id = p.id
+         and v.in_stock = true
+        where p.status = 'active'
+        group by p.id
+      )
+      insert into offer_inventory_snapshots (snapshot_at, provider_id, live_offer_count)
+      select s.snapshot_at, c.provider_id, c.live_offer_count
+      from snapshot_ts s, provider_counts c
+      on conflict (provider_id, snapshot_at) do update
+      set live_offer_count = excluded.live_offer_count
+      returning provider_id, live_offer_count
+    `;
+
+    const count = Array.isArray(rows) ? rows.length : 0;
+    console.log(
+      `Offer inventory snapshot cron: upserted ${count} provider rows.`
+    );
+  } catch (err: any) {
+    console.error(
+      "Offer inventory snapshot cron: fatal error:",
+      err?.message || err
+    );
+  }
 }

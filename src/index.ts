@@ -98,6 +98,96 @@ app.get("/popular-brands", async (c) => {
   });
 });
 
+// GET /analytics/live-offers?window_hours=168
+// Returns time series of live offers based on offer_inventory_snapshots:
+//  - totals: summed live offers across all providers per snapshot_at
+//  - by_provider: per-provider series with provider metadata
+app.get("/analytics/live-offers", async (c) => {
+  const sql = getDb(c.env);
+
+  const windowParam = c.req.query("window_hours") || "168";
+  const windowHoursRaw = Number.parseInt(windowParam, 10);
+  const windowHours = Number.isFinite(windowHoursRaw)
+    ? Math.min(Math.max(windowHoursRaw, 1), 24 * 30)
+    : 168;
+
+  const rows = await sql/* sql */ `
+    select
+      s.snapshot_at,
+      s.provider_id,
+      p.name as provider_name,
+      p.slug as provider_slug,
+      s.live_offer_count
+    from offer_inventory_snapshots s
+    join providers p on p.id = s.provider_id
+    where s.snapshot_at >= now() - (${windowHours} * interval '1 hour')
+    order by s.snapshot_at asc, p.name asc
+  `;
+
+  type Row = {
+    snapshot_at: string;
+    provider_id: string;
+    provider_name: string;
+    provider_slug: string;
+    live_offer_count: number | string;
+  };
+
+  const totalsMap = new Map<string, number>();
+  const perProvider = new Map<
+    string,
+    {
+      provider_id: string;
+      provider_name: string;
+      provider_slug: string;
+      snapshots: { snapshot_at: string; live_offer_count: number }[];
+    }
+  >();
+
+  for (const r of rows as any as Row[]) {
+    const snapshotAt = r.snapshot_at;
+    const liveCount =
+      typeof r.live_offer_count === "number"
+        ? r.live_offer_count
+        : Number(r.live_offer_count);
+    const prevTotal = totalsMap.get(snapshotAt) ?? 0;
+    totalsMap.set(snapshotAt, prevTotal + liveCount);
+
+    let entry = perProvider.get(r.provider_id);
+    if (!entry) {
+      entry = {
+        provider_id: r.provider_id,
+        provider_name: r.provider_name,
+        provider_slug: r.provider_slug,
+        snapshots: [],
+      };
+      perProvider.set(r.provider_id, entry);
+    }
+    entry.snapshots.push({
+      snapshot_at: snapshotAt,
+      live_offer_count: liveCount,
+    });
+  }
+
+  const totals = Array.from(totalsMap.entries())
+    .map(([snapshot_at, live_offer_count]) => ({
+      snapshot_at,
+      live_offer_count,
+    }))
+    .sort((a, b) =>
+      a.snapshot_at < b.snapshot_at ? -1 : a.snapshot_at > b.snapshot_at ? 1 : 0
+    );
+
+  const byProvider = Array.from(perProvider.values()).sort((a, b) =>
+    a.provider_name.localeCompare(b.provider_name)
+  );
+
+  return c.json({
+    window_hours: windowHours,
+    totals,
+    by_provider: byProvider,
+  });
+});
+
 // Simple API key protection for extension traffic. If EXTENSION_API_KEY is
 // configured in the Worker environment, require matching X-Extension-Key.
 app.use("/offers", async (c, next) => {
