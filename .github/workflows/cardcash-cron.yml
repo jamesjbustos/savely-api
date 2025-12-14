@@ -23,9 +23,6 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Playwright system dependencies
-        run: sudo npx -y playwright install-deps chromium
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
