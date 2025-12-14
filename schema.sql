@@ -306,6 +306,21 @@ CREATE TABLE public.brands (
 ALTER TABLE public.brands OWNER TO neondb_owner;
 
 --
+-- Name: offer_inventory_snapshots; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.offer_inventory_snapshots (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    snapshot_at timestamp with time zone NOT NULL,
+    provider_id uuid NOT NULL,
+    live_offer_count integer NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.offer_inventory_snapshots OWNER TO neondb_owner;
+
+--
 -- Name: provider_brand_discount_history; Type: TABLE; Schema: public; Owner: neondb_owner
 --
 
@@ -404,21 +419,6 @@ CREATE TABLE public.providers (
 
 
 ALTER TABLE public.providers OWNER TO neondb_owner;
-
---
--- Name: offer_inventory_snapshots; Type: TABLE; Schema: public; Owner: neondb_owner
---
-
-CREATE TABLE public.offer_inventory_snapshots (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    snapshot_at timestamp with time zone NOT NULL,
-    provider_id uuid NOT NULL,
-    live_offer_count integer NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
-ALTER TABLE public.offer_inventory_snapshots OWNER TO neondb_owner;
 
 --
 -- Name: v_brand_daily_viewers; Type: VIEW; Schema: public; Owner: neondb_owner
@@ -538,6 +538,14 @@ ALTER TABLE ONLY public.brands
 
 
 --
+-- Name: offer_inventory_snapshots offer_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.offer_inventory_snapshots
+    ADD CONSTRAINT offer_inventory_snapshots_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: provider_brand_discount_history provider_brand_discount_history_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -586,18 +594,17 @@ ALTER TABLE ONLY public.providers
 
 
 --
--- Name: offer_inventory_snapshots offer_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
---
-
-ALTER TABLE ONLY public.offer_inventory_snapshots
-    ADD CONSTRAINT offer_inventory_snapshots_pkey PRIMARY KEY (id);
-
-
---
 -- Name: idx_brand_daily_viewers_brand_day; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
 CREATE INDEX idx_brand_daily_viewers_brand_day ON public.brand_daily_viewers USING btree (brand_id, day);
+
+
+--
+-- Name: idx_brand_daily_viewers_created_at; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brand_daily_viewers_created_at ON public.brand_daily_viewers USING btree (created_at);
 
 
 --
@@ -619,6 +626,13 @@ CREATE INDEX idx_brand_events_created_at ON public.brand_events USING btree (cre
 --
 
 CREATE INDEX idx_brand_redeemable_by_domain ON public.brand_redeemable_domains USING btree (lower((domain)::text));
+
+
+--
+-- Name: idx_brands_base_domain_lower_active; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brands_base_domain_lower_active ON public.brands USING btree (lower((base_domain)::text)) WHERE (status = 'active'::text);
 
 
 --
@@ -706,6 +720,13 @@ CREATE UNIQUE INDEX uq_brands_name_lower ON public.brands USING btree (lower(nam
 
 
 --
+-- Name: uq_offer_inventory_snapshot_provider_time; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE UNIQUE INDEX uq_offer_inventory_snapshot_provider_time ON public.offer_inventory_snapshots USING btree (provider_id, snapshot_at);
+
+
+--
 -- Name: uq_pbp_provider_brand_variant_external; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -717,13 +738,6 @@ CREATE UNIQUE INDEX uq_pbp_provider_brand_variant_external ON public.provider_br
 --
 
 CREATE UNIQUE INDEX uq_provider_brand ON public.provider_brand_discounts USING btree (provider_id, brand_id);
-
-
---
--- Name: uq_offer_inventory_snapshot_provider_time; Type: INDEX; Schema: public; Owner: neondb_owner
---
-
-CREATE UNIQUE INDEX uq_offer_inventory_snapshot_provider_time ON public.offer_inventory_snapshots USING btree (provider_id, snapshot_at);
 
 
 --
@@ -780,6 +794,14 @@ ALTER TABLE ONLY public.brand_events
 
 ALTER TABLE ONLY public.brand_redeemable_domains
     ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: offer_inventory_snapshots offer_inventory_snapshots_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.offer_inventory_snapshots
+    ADD CONSTRAINT offer_inventory_snapshots_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
 
 
 --
@@ -855,14 +877,6 @@ ALTER TABLE ONLY public.provider_brand_products
 
 
 --
--- Name: offer_inventory_snapshots offer_inventory_snapshots_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
---
-
-ALTER TABLE ONLY public.offer_inventory_snapshots
-    ADD CONSTRAINT offer_inventory_snapshots_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE CASCADE;
-
-
---
 -- Name: SCHEMA public; Type: ACL; Schema: -; Owner: neondb_owner
 --
 
@@ -872,3 +886,4 @@ REVOKE USAGE ON SCHEMA public FROM PUBLIC;
 --
 -- PostgreSQL database dump complete
 --
+
