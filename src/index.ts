@@ -5,6 +5,7 @@ import { getDb } from "./db.ts";
 type Env = {
   DATABASE_URL: string;
   EXTENSION_API_KEY: string;
+  HYPERDRIVE?: { connectionString: string };
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -33,17 +34,49 @@ app.use("*", async (c, next) => {
   c.res.headers.set("X-Frame-Options", "DENY");
 });
 
-const OFFERS_CACHE_TTL_MS = 30_000;
 const OFFERS_CLIENT_TTL_SECONDS = 30;
-const ANALYTICS_CACHE_TTL_MS = 60_000;
 
-function getOffersCache() {
+function getCache() {
   const globalCaches = (globalThis as any).caches;
   if (!globalCaches || !globalCaches.default) return null;
   return globalCaches.default as {
     match(request: Request): Promise<Response | undefined>;
     put(request: Request, response: Response): Promise<void>;
   };
+}
+
+// Cache helper: checks cache, returns cached response if fresh, otherwise null.
+// Uses Cache-Control max-age natively instead of manual timestamp tracking.
+async function getCached(url: string): Promise<{ cache: any; cacheKey: Request; cached: Response | null }> {
+  const cache = getCache();
+  if (!cache) return { cache: null, cacheKey: null as any, cached: null };
+  const cacheKey = new Request(url, { method: "GET" });
+  const cached = await cache.match(cacheKey) ?? null;
+  return { cache, cacheKey, cached };
+}
+
+// Store response in cache with proper Cache-Control header and optional client SWR.
+function cacheResponse(
+  response: Response,
+  cache: any,
+  cacheKey: Request,
+  ctx: { waitUntil?(p: Promise<unknown>): void } | undefined,
+  maxAgeSec: number,
+  swrSec = 0,
+) {
+  const parts = [`public`, `max-age=${maxAgeSec}`];
+  if (swrSec > 0) parts.push(`stale-while-revalidate=${swrSec}`);
+  response.headers.set("Cache-Control", parts.join(", "));
+
+  if (cache && cacheKey && ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(
+      cache.put(cacheKey, response.clone()).catch((err: unknown) => {
+        console.error("Cache put error:", err);
+      }),
+    );
+  }
+
+  return response;
 }
 
 function variantToLabel(variant: string | null | undefined): string | null {
@@ -59,25 +92,10 @@ app.get("/health", (c) => c.text("ok"));
 // Public directory of brands with their best available discount.
 // Supports optional search, discount filtering, sorting, and pagination.
 app.get("/brands", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const qRaw = c.req.query("q") || "";
   const searchTerm = qRaw.trim();
@@ -293,45 +311,16 @@ app.get("/brands", async (c) => {
     brands: paginated,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /brands response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /brands/:slug
 // Public detail view for a single brand and its provider offers.
 app.get("/brands/:slug", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
-
   const slug = c.req.param("slug");
 
   const brandRows = await sql/* sql */ `
@@ -450,44 +439,16 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /brands/:slug response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /categories
 // Returns all categories with computed brand counts and max discounts.
 app.get("/categories", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const rows = await sql/* sql */ `
     select
@@ -549,45 +510,16 @@ app.get("/categories", async (c) => {
 
   const response = c.json({ categories });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /categories response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 3600, 600);
 });
 
 // GET /categories/:slug
 // Returns single category with paginated brands.
 app.get("/categories/:slug", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
-
   const slug = c.req.param("slug");
 
   const categoryRows = await sql/* sql */ `
@@ -621,15 +553,35 @@ app.get("/categories/:slug", async (c) => {
     : 24;
   const offset = (page - 1) * pageSize;
 
-  const statsRow = await sql/* sql */ `
-    select
-      count(distinct b.id) as total,
-      max(pbd.max_discount_percent) as max_discount
-    from brands b
-    left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
-    where b.category_id = ${categoryRow.id}
-      and b.status = 'active'
-  `;
+  // Run stats and brand queries in parallel — both only need categoryRow.id
+  const [statsRow, brandRows] = await Promise.all([
+    sql/* sql */ `
+      select
+        count(distinct b.id) as total,
+        max(pbd.max_discount_percent) as max_discount
+      from brands b
+      left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+      where b.category_id = ${categoryRow.id}
+        and b.status = 'active'
+    `,
+    sql/* sql */ `
+      select
+        b.id,
+        b.name,
+        b.slug,
+        b.base_domain,
+        max(pbd.max_discount_percent) as max_discount_percent,
+        bool_or(pbd.in_stock) as in_stock
+      from brands b
+      left join provider_brand_discounts pbd on pbd.brand_id = b.id
+      where b.category_id = ${categoryRow.id}
+        and b.status = 'active'
+      group by b.id, b.name, b.slug, b.base_domain
+      order by b.name asc
+      limit ${pageSize}
+      offset ${offset}
+    `,
+  ]);
 
   const total =
     typeof (statsRow[0] as any)?.total === "number"
@@ -642,24 +594,6 @@ app.get("/categories/:slug", async (c) => {
       : typeof (statsRow[0] as any).max_discount === "number"
       ? (statsRow[0] as any).max_discount
       : Number((statsRow[0] as any).max_discount) || 0;
-
-  const brandRows = await sql/* sql */ `
-    select
-      b.id,
-      b.name,
-      b.slug,
-      b.base_domain,
-      max(pbd.max_discount_percent) as max_discount_percent,
-      bool_or(pbd.in_stock) as in_stock
-    from brands b
-    left join provider_brand_discounts pbd on pbd.brand_id = b.id
-    where b.category_id = ${categoryRow.id}
-      and b.status = 'active'
-    group by b.id, b.name, b.slug, b.base_domain
-    order by b.name asc
-    limit ${pageSize}
-    offset ${offset}
-  `;
 
   type BrandRow = {
     id: string;
@@ -703,20 +637,7 @@ app.get("/categories/:slug", async (c) => {
     brands,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /categories/:slug response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /popular-brands?window_hours=24&limit=20
@@ -795,25 +716,10 @@ app.get("/popular-brands", async (c) => {
 // GET /analytics/biggest-price-drops?window_hours=24&limit=20
 // Biggest positive changes in max discount over the window, aggregated per brand.
 app.get("/analytics/biggest-price-drops", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const windowParam = c.req.query("window_hours") || "24";
   const limitParam = c.req.query("limit") || "20";
@@ -955,48 +861,17 @@ app.get("/analytics/biggest-price-drops", async (c) => {
     brands,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error(
-            "Error caching /analytics/biggest-price-drops response:",
-            err
-          );
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /analytics/popular-giftcards?window_hours=24&limit=20
 // Popular brands based on recent viewers, restricted to brands that currently
 // have live offers, and annotated with best current discount.
 app.get("/analytics/popular-giftcards", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const windowParam = c.req.query("window_hours") || "24";
   const limitParam = c.req.query("limit") || "20";
@@ -1077,47 +952,16 @@ app.get("/analytics/popular-giftcards", async (c) => {
     brands,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error(
-            "Error caching /analytics/popular-giftcards response:",
-            err
-          );
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /analytics/top-discounts?limit=20
 // Highest current discounts per brand (best offer per brand).
 app.get("/analytics/top-discounts", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const limitParam = c.req.query("limit") || "20";
   const limitRaw = Number.parseInt(limitParam, 10);
@@ -1176,23 +1020,7 @@ app.get("/analytics/top-discounts", async (c) => {
     brands,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error(
-            "Error caching /analytics/top-discounts response:",
-            err
-          );
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // GET /analytics/live-offers?window_hours=168
@@ -1200,25 +1028,10 @@ app.get("/analytics/top-discounts", async (c) => {
 //  - totals: summed live offers across all providers per snapshot_at
 //  - by_provider: per-provider series with provider metadata
 app.get("/analytics/live-offers", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
-
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < ANALYTICS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
 
   const windowParam = c.req.query("window_hours") || "168";
   const windowHoursRaw = Number.parseInt(windowParam, 10);
@@ -1316,20 +1129,7 @@ app.get("/analytics/live-offers", async (c) => {
     current_total_live_offers: currentTotal,
   });
 
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /analytics/live-offers response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
 });
 
 // API key protection for extension-only endpoints.
@@ -1509,23 +1309,8 @@ app.get("/offers", async (c) => {
     return c.json({ error: "Missing required query param: domain" }, 400);
   }
 
-  const cache = getOffersCache();
-  const cacheKey = cache ? new Request(c.req.url, { method: "GET" }) : null;
-
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const cachedAtHeader = cached.headers.get("X-Savely-Cache-At");
-      const cachedAt = cachedAtHeader ? Number(cachedAtHeader) : 0;
-      if (
-        Number.isFinite(cachedAt) &&
-        cachedAt > 0 &&
-        Date.now() - cachedAt < OFFERS_CACHE_TTL_MS
-      ) {
-        return cached;
-      }
-    }
-  }
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
 
   const sql = getDb(c.env);
 
@@ -1707,25 +1492,7 @@ app.get("/offers", async (c) => {
     offers: clickableOffers,
   });
 
-  response.headers.set(
-    "X-Savely-Offers-TTL-Seconds",
-    String(OFFERS_CLIENT_TTL_SECONDS)
-  );
-
-  if (cache && cacheKey && c.executionCtx && c.executionCtx.waitUntil) {
-    response.headers.set("X-Savely-Cache-At", String(Date.now()));
-    c.executionCtx.waitUntil(
-      (async () => {
-        try {
-          await cache.put(cacheKey, response.clone());
-        } catch (err) {
-          console.error("Error caching /offers response:", err);
-        }
-      })()
-    );
-  }
-
-  return response;
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, OFFERS_CLIENT_TTL_SECONDS, 15);
 });
 
 // GET /brands/:slug/discount-history
