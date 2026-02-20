@@ -47,11 +47,20 @@ function getCache() {
 
 // Cache helper: checks cache, returns cached response if fresh, otherwise null.
 // Uses Cache-Control max-age natively instead of manual timestamp tracking.
+// Cached responses are rebuilt with mutable headers so downstream middleware
+// (e.g. security headers) can modify them without hitting "immutable headers" errors.
 async function getCached(url: string): Promise<{ cache: any; cacheKey: Request; cached: Response | null }> {
   const cache = getCache();
   if (!cache) return { cache: null, cacheKey: null as any, cached: null };
   const cacheKey = new Request(url, { method: "GET" });
-  const cached = await cache.match(cacheKey) ?? null;
+  const match = await cache.match(cacheKey);
+  if (!match) return { cache, cacheKey, cached: null };
+  // Reconstruct with mutable headers — Cache API responses have immutable headers
+  const cached = new Response(match.body, {
+    status: match.status,
+    statusText: match.statusText,
+    headers: new Headers(match.headers),
+  });
   return { cache, cacheKey, cached };
 }
 
