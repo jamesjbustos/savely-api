@@ -7,7 +7,8 @@
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
     "cron:cardcash": "node scripts/cron-cardcash.mjs",
     "cron:offer-inventory": "tsx scripts/run-offer-inventory-cron.ts",
-    "cron:fast": "tsx scripts/run-fast-crons.ts"
+    "cron:fast": "tsx scripts/run-fast-crons.ts",
+    "classify-brands": "tsx scripts/run-category-cron.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",

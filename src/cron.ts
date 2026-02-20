@@ -5,6 +5,7 @@ import {
   slugifyBrandName,
   mapVariantFromStrings,
 } from "./brandUtils.ts";
+import { mapIabToCategory } from "./categoryMapping.ts";
 
 type CronEnv = {
   DATABASE_URL: string;
@@ -1155,4 +1156,352 @@ export async function runOfferInventorySnapshotCron(env: CronEnv) {
       err?.message || err
     );
   }
+}
+
+type CategoryCronEnv = CronEnv & {
+  GOOGLE_SEARCH_API_KEY: string;
+  GOOGLE_SEARCH_CX: string;
+  ANTHROPIC_API_KEY: string;
+};
+
+const CATEGORY_SLUGS = [
+  "food-dining",
+  "retail-shopping",
+  "entertainment",
+  "travel-hotels",
+  "home-garden",
+  "electronics",
+  "beauty-wellness",
+  "fashion-apparel",
+  "sports-fitness",
+  "automotive",
+  "office-supplies",
+  "pet-supplies",
+  "books-media",
+  "toys-games",
+  "other",
+] as const;
+
+type GoogleSearchResult = {
+  title: string;
+  snippet: string;
+  link: string;
+};
+
+type BrandSearchContext = {
+  results: GoogleSearchResult[];
+  officialSiteTitle: string | null;
+  officialSiteSnippet: string | null;
+};
+
+async function searchBrandContext(
+  brandName: string,
+  domain: string,
+  apiKey: string,
+  cx: string
+): Promise<BrandSearchContext | null> {
+  const query = encodeURIComponent(`${brandName} ${domain}`);
+  const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cx}&q=${query}&num=5`;
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error(`Google Search error: ${res.status}`);
+      return null;
+    }
+
+    const data: any = await res.json();
+    const items = data?.items;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return null;
+    }
+
+    const results: GoogleSearchResult[] = items.map((item: any) => ({
+      title: String(item.title || "").trim(),
+      snippet: String(item.snippet || "").trim(),
+      link: String(item.link || "").trim(),
+    }));
+
+    // Find official site result
+    let officialSiteTitle: string | null = null;
+    let officialSiteSnippet: string | null = null;
+
+    for (const item of items) {
+      const link = String(item.link || "").toLowerCase();
+      if (link.includes(domain.toLowerCase())) {
+        officialSiteTitle = String(item.title || "").trim() || null;
+        officialSiteSnippet = String(item.snippet || "").trim() || null;
+        break;
+      }
+    }
+
+    return {
+      results,
+      officialSiteTitle,
+      officialSiteSnippet,
+    };
+  } catch (err: any) {
+    console.error(`Google Search error:`, err?.message || err);
+    return null;
+  }
+}
+
+type ClassificationResult = {
+  category: string;
+  confidence: number;
+  description: string;
+};
+
+async function classifyWithClaude(
+  brandName: string,
+  domain: string,
+  context: BrandSearchContext,
+  apiKey: string
+): Promise<ClassificationResult | null> {
+  // Build rich context from Google Search results
+  const searchContext = context.results
+    .slice(0, 5)
+    .map((r, i) => `Result ${i + 1}:\n  Title: ${r.title}\n  Snippet: ${r.snippet}\n  URL: ${r.link}`)
+    .join("\n\n");
+
+  const officialContext = context.officialSiteTitle || context.officialSiteSnippet
+    ? `\nOfficial Site Info:\n  Title: ${context.officialSiteTitle || "N/A"}\n  Description: ${context.officialSiteSnippet || "N/A"}`
+    : "";
+
+  const prompt = `You are a brand analyst. Given a brand name, domain, and search results, you must:
+1. Write an ORIGINAL 1-2 sentence description of the brand in third person
+2. Classify the brand into exactly ONE category
+3. Provide your confidence level (0-100)
+
+DESCRIPTION RULES:
+- Write in third person (e.g., "Nike is..." not "Get Nike...")
+- Be factual and professional, not promotional
+- DO NOT copy text from the search results
+- DO NOT include "...", "→", marketing slogans, or incomplete sentences
+- Start with "[Brand Name] is..." or "[Brand Name] offers..."
+- Focus on: what they sell, what industry they're in, what makes them known
+
+Categories:
+- food-dining: Restaurants, food delivery, groceries, coffee shops, cafes
+- retail-shopping: General merchandise, department stores, marketplaces, discount stores
+- entertainment: Movies, music, streaming, gaming, events, tickets
+- travel-hotels: Airlines, hotels, vacation rentals, travel booking, cruises
+- home-garden: Furniture, home decor, home improvement, gardening, appliances
+- electronics: Computers, phones, tech gadgets, electronics stores, software
+- beauty-wellness: Cosmetics, skincare, spa, salons, wellness, personal care
+- fashion-apparel: Clothing, shoes, accessories, jewelry, watches
+- sports-fitness: Athletic gear, gyms, sporting goods, outdoor equipment
+- automotive: Auto parts, car services, fuel, dealerships, car rental
+- office-supplies: Office equipment, stationery, business supplies, printing
+- pet-supplies: Pet food, pet toys, veterinary, pet stores
+- books-media: Books, magazines, news, educational content, audiobooks
+- toys-games: Toys, board games, hobbies, crafts, collectibles
+- other: Only use if brand truly doesn't fit ANY above category
+
+Brand: ${brandName}
+Domain: ${domain}
+${officialContext}
+
+Search Results:
+${searchContext}
+
+EXAMPLE good descriptions:
+- "Starbucks is a global coffeehouse chain known for handcrafted espresso drinks, teas, and pastries."
+- "Nike is a multinational sportswear company that designs and sells athletic footwear, apparel, and equipment."
+- "Home Depot is a home improvement retailer offering tools, building materials, appliances, and services."
+
+Respond in this exact JSON format (no markdown, no code blocks):
+{"description": "Your 1-2 sentence brand description here.", "category": "category-slug", "confidence": 85}`;
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      console.error(`Claude API error: ${res.status} - ${text.slice(0, 200)}`);
+      return null;
+    }
+
+    const data: any = await res.json();
+    const response = data?.content?.[0]?.text || "";
+
+    // Parse JSON response
+    let parsed: any;
+    try {
+      // Clean up response in case Claude adds markdown
+      const cleaned = response.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      parsed = JSON.parse(cleaned);
+    } catch {
+      console.error(`Claude returned invalid JSON: ${response.slice(0, 200)}`);
+      return null;
+    }
+
+    const category = String(parsed.category || "other").toLowerCase().trim();
+    const confidence = Number(parsed.confidence) || 0;
+    const description = String(parsed.description || "").trim();
+
+    // Validate category slug
+    const validCategory = CATEGORY_SLUGS.includes(category as any) ? category : "other";
+
+    return {
+      category: validCategory,
+      confidence,
+      description,
+    };
+  } catch (err: any) {
+    console.error(`Claude API error:`, err?.message || err);
+    return null;
+  }
+}
+
+export async function runBrandCategoryCron(env: CategoryCronEnv) {
+  const sql = getDb(env);
+
+  if (!env.GOOGLE_SEARCH_API_KEY || !env.GOOGLE_SEARCH_CX) {
+    console.error("Brand category cron: GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_CX are required");
+    return;
+  }
+
+  if (!env.ANTHROPIC_API_KEY) {
+    console.error("Brand category cron: ANTHROPIC_API_KEY is required");
+    return;
+  }
+
+  // Fetch all brands that need classification (have domain, no category OR no description, active)
+  const brands = await sql/* sql */ `
+    select id, name, base_domain, description
+    from brands
+    where base_domain is not null
+      and (category_id is null or description is null)
+      and status = 'active'
+    order by created_at asc
+  `;
+
+  if (!brands.length) {
+    console.log("Brand category cron: no brands to classify");
+    return;
+  }
+
+  console.log(`Brand category cron: processing ${brands.length} brands`);
+
+  // Fetch category slug -> id mapping
+  const categoryRows = await sql/* sql */ `
+    select id, slug from categories
+  `;
+
+  const categoryMap = new Map<string, string>();
+  for (const row of categoryRows as any[]) {
+    categoryMap.set(row.slug as string, row.id as string);
+  }
+
+  const CONFIDENCE_THRESHOLD = 80;
+
+  let processed = 0;
+  let skippedLowConfidence = 0;
+  let errors = 0;
+
+  for (const brand of brands as any[]) {
+    const brandId = brand.id as string;
+    const brandName = brand.name as string;
+    const domain = String(brand.base_domain ?? "").trim();
+
+    if (!domain) continue;
+
+    // Rate limit: 200ms delay between requests (Google has rate limits)
+    if (processed > 0 || errors > 0 || skippedLowConfidence > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    try {
+      // Step 1: Get rich context from Google Search
+      const context = await searchBrandContext(
+        brandName,
+        domain,
+        env.GOOGLE_SEARCH_API_KEY,
+        env.GOOGLE_SEARCH_CX
+      );
+
+      if (!context || context.results.length === 0) {
+        console.warn(`Brand category cron: no search results for "${brandName}" (${domain})`);
+        errors += 1;
+        continue;
+      }
+
+      // Step 2: Classify and generate description using Claude
+      const result = await classifyWithClaude(
+        brandName,
+        domain,
+        context,
+        env.ANTHROPIC_API_KEY
+      );
+
+      if (!result) {
+        console.error(`Brand category cron: Claude failed for "${brandName}"`);
+        errors += 1;
+        continue;
+      }
+
+      // Step 3: Check confidence threshold
+      if (result.confidence < CONFIDENCE_THRESHOLD) {
+        console.warn(
+          `Brand category cron: LOW CONFIDENCE (${result.confidence}%) for "${brandName}" → ${result.category} | Skipping`
+        );
+        skippedLowConfidence += 1;
+        continue;
+      }
+
+      const categoryId = categoryMap.get(result.category) || categoryMap.get("other");
+
+      if (!categoryId) {
+        console.error(`Brand category cron: could not find category for slug ${result.category}`);
+        errors += 1;
+        continue;
+      }
+
+      // Step 4: Update brand with description and category
+      await sql/* sql */ `
+        update brands
+        set
+          description = ${result.description || null},
+          category_id = ${categoryId},
+          updated_at = now()
+        where id = ${brandId}
+      `;
+
+      // Log classification history with confidence
+      await sql/* sql */ `
+        insert into brand_classifications (brand_id, category_id, iab_category_raw, iab_confidence, source)
+        values (${brandId}, ${categoryId}, ${result.category}, ${result.confidence / 100}, 'google-search-claude')
+      `;
+
+      console.log(
+        `Brand category cron: "${brandName}" → ${result.category} (${result.confidence}%) | "${result.description.slice(0, 50)}..."`
+      );
+
+      processed += 1;
+    } catch (err: any) {
+      console.error(
+        `Brand category cron: error processing ${brandName} (${domain}):`,
+        err?.message || err
+      );
+      errors += 1;
+    }
+  }
+
+  console.log(
+    `Brand category cron: processed ${processed} brands, ${skippedLowConfidence} skipped (low confidence), ${errors} errors`
+  );
 }

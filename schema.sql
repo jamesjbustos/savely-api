@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 17.7 (178558d)
--- Dumped by pg_dump version 17.7 (178558d)
+-- Dumped from database version 17.7 (bdd1736)
+-- Dumped by pg_dump version 17.7 (bdd1736)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -177,6 +177,23 @@ CREATE TABLE public.brand_aliases (
 ALTER TABLE public.brand_aliases OWNER TO neondb_owner;
 
 --
+-- Name: brand_classifications; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.brand_classifications (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    brand_id uuid NOT NULL,
+    category_id uuid,
+    iab_category_raw text,
+    iab_confidence numeric(4,3),
+    classified_at timestamp with time zone DEFAULT now() NOT NULL,
+    source text DEFAULT 'klazify'::text
+);
+
+
+ALTER TABLE public.brand_classifications OWNER TO neondb_owner;
+
+--
 -- Name: brand_daily_viewers; Type: TABLE; Schema: public; Owner: neondb_owner
 --
 
@@ -299,11 +316,55 @@ CREATE TABLE public.brands (
     base_domain public.citext,
     status text DEFAULT 'active'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    category_id uuid,
+    description text
 );
 
 
 ALTER TABLE public.brands OWNER TO neondb_owner;
+
+--
+-- Name: categories; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.categories (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    slug text NOT NULL,
+    description text,
+    icon_name text NOT NULL,
+    tone text,
+    display_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE public.categories OWNER TO neondb_owner;
+
+--
+-- Name: extension_events; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.extension_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    viewer_id text NOT NULL,
+    event_type text NOT NULL,
+    brand_id uuid,
+    provider_id uuid,
+    provider_slug text,
+    domain public.citext,
+    product_url text,
+    discount_percent numeric(5,2),
+    extension_version text,
+    browser text,
+    metadata jsonb DEFAULT '{}'::jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_extension_events_type CHECK ((event_type = ANY (ARRAY['offer_click'::text, 'offer_impression'::text, 'modal_opened'::text, 'side_tab_click'::text])))
+);
+
+
+ALTER TABLE public.extension_events OWNER TO neondb_owner;
 
 --
 -- Name: offer_inventory_snapshots; Type: TABLE; Schema: public; Owner: neondb_owner
@@ -421,6 +482,23 @@ CREATE TABLE public.providers (
 ALTER TABLE public.providers OWNER TO neondb_owner;
 
 --
+-- Name: user_feedback; Type: TABLE; Schema: public; Owner: neondb_owner
+--
+
+CREATE TABLE public.user_feedback (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    rating text,
+    message text,
+    extension_version text,
+    browser text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT chk_user_feedback_rating CHECK (((rating IS NULL) OR (rating = ANY (ARRAY['very-bad'::text, 'bad'::text, 'neutral'::text, 'good'::text, 'very-good'::text]))))
+);
+
+
+ALTER TABLE public.user_feedback OWNER TO neondb_owner;
+
+--
 -- Name: v_brand_daily_viewers; Type: VIEW; Schema: public; Owner: neondb_owner
 --
 
@@ -471,6 +549,14 @@ ALTER VIEW public.v_brand_provider_offers OWNER TO neondb_owner;
 
 ALTER TABLE ONLY public.brand_aliases
     ADD CONSTRAINT brand_aliases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: brand_classifications brand_classifications_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_classifications
+    ADD CONSTRAINT brand_classifications_pkey PRIMARY KEY (id);
 
 
 --
@@ -538,6 +624,30 @@ ALTER TABLE ONLY public.brands
 
 
 --
+-- Name: categories categories_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.categories
+    ADD CONSTRAINT categories_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: categories categories_slug_key; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.categories
+    ADD CONSTRAINT categories_slug_key UNIQUE (slug);
+
+
+--
+-- Name: extension_events extension_events_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.extension_events
+    ADD CONSTRAINT extension_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: offer_inventory_snapshots offer_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -594,6 +704,14 @@ ALTER TABLE ONLY public.providers
 
 
 --
+-- Name: user_feedback user_feedback_pkey; Type: CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.user_feedback
+    ADD CONSTRAINT user_feedback_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: idx_brand_daily_viewers_brand_day; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -636,6 +754,55 @@ CREATE INDEX idx_brands_base_domain_lower_active ON public.brands USING btree (l
 
 
 --
+-- Name: idx_brands_category; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_brands_category ON public.brands USING btree (category_id) WHERE (category_id IS NOT NULL);
+
+
+--
+-- Name: idx_extension_events_brand; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_brand ON public.extension_events USING btree (brand_id) WHERE (brand_id IS NOT NULL);
+
+
+--
+-- Name: idx_extension_events_created; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_created ON public.extension_events USING btree (created_at DESC);
+
+
+--
+-- Name: idx_extension_events_domain; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_domain ON public.extension_events USING btree (domain) WHERE (domain IS NOT NULL);
+
+
+--
+-- Name: idx_extension_events_provider; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_provider ON public.extension_events USING btree (provider_id) WHERE (provider_id IS NOT NULL);
+
+
+--
+-- Name: idx_extension_events_type; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_type ON public.extension_events USING btree (event_type);
+
+
+--
+-- Name: idx_extension_events_viewer; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_viewer ON public.extension_events USING btree (viewer_id);
+
+
+--
 -- Name: idx_pbd_brand; Type: INDEX; Schema: public; Owner: neondb_owner
 --
 
@@ -661,6 +828,20 @@ CREATE INDEX idx_pbdh_provider_brand_time ON public.provider_brand_discount_hist
 --
 
 CREATE INDEX idx_pbl_brand_provider_fetched ON public.provider_brand_listings USING btree (brand_id, provider_id, fetched_at DESC);
+
+
+--
+-- Name: idx_user_feedback_created_at; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_user_feedback_created_at ON public.user_feedback USING btree (created_at DESC);
+
+
+--
+-- Name: idx_user_feedback_rating; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_user_feedback_rating ON public.user_feedback USING btree (rating);
 
 
 --
@@ -749,6 +930,22 @@ ALTER TABLE ONLY public.brand_aliases
 
 
 --
+-- Name: brand_classifications brand_classifications_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_classifications
+    ADD CONSTRAINT brand_classifications_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brand_classifications brand_classifications_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brand_classifications
+    ADD CONSTRAINT brand_classifications_category_id_fkey FOREIGN KEY (category_id) REFERENCES public.categories(id);
+
+
+--
 -- Name: brand_domain_candidates brand_domain_candidates_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
 --
 
@@ -794,6 +991,30 @@ ALTER TABLE ONLY public.brand_events
 
 ALTER TABLE ONLY public.brand_redeemable_domains
     ADD CONSTRAINT brand_redeemable_domains_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE CASCADE;
+
+
+--
+-- Name: brands brands_category_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.brands
+    ADD CONSTRAINT brands_category_id_fkey FOREIGN KEY (category_id) REFERENCES public.categories(id) ON DELETE SET NULL;
+
+
+--
+-- Name: extension_events extension_events_brand_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.extension_events
+    ADD CONSTRAINT extension_events_brand_id_fkey FOREIGN KEY (brand_id) REFERENCES public.brands(id) ON DELETE SET NULL;
+
+
+--
+-- Name: extension_events extension_events_provider_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: neondb_owner
+--
+
+ALTER TABLE ONLY public.extension_events
+    ADD CONSTRAINT extension_events_provider_id_fkey FOREIGN KEY (provider_id) REFERENCES public.providers(id) ON DELETE SET NULL;
 
 
 --
