@@ -100,8 +100,9 @@ export async function runCardCenterCron(env: CronEnv) {
     if (!externalId || !providerBrandName || !providerBrandSlug) continue;
 
     const discounts = item?.discounts;
+    const low = Number(discounts?.low ?? 0) || 0;
     const high = Number(discounts?.high ?? 0) || 0;
-    const hasDiscount = !!discounts && high > 0;
+    const hasDiscount = !!discounts && (low > 0 || high > 0);
     if (!hasDiscount) {
       // As before: brands without discounts (e.g., Coach) are treated as
       // out of stock / not on sale, so we don't flip them back to true here.
@@ -151,9 +152,9 @@ export async function runCardCenterCron(env: CronEnv) {
 
     const inStock = true; // items with discounts are treated as available
 
-    // CardCenter's "high" discount includes an extra 3% for Zelle;
-    // subtract 3 percentage points to get the true card discount.
-    const maxDiscountPercent = Math.max(0, high * 100 - 3);
+    // CardCenter's API returns "low" (card discount) and "high" (Zelle
+    // discount) separately.  Use "low" as the true card discount.
+    const maxDiscountPercent = low * 100;
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
       inStock: false,
