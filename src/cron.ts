@@ -151,9 +151,9 @@ export async function runCardCenterCron(env: CronEnv) {
 
     const inStock = true; // items with discounts are treated as available
 
-    // CardCenter's "high" discount includes an extra 3% for Zelle;
-    // subtract 3 percentage points to get the true card discount.
-    const maxDiscountPercent = Math.max(0, high * 100 - 3);
+    // CardCenter's "high" discount is the best available rate.  Zelle is
+    // offline so discounts no longer include a Zelle bonus.
+    const maxDiscountPercent = high * 100;
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
       inStock: false,
