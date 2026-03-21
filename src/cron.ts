@@ -11,6 +11,13 @@ type CronEnv = {
   DATABASE_URL: string;
 };
 
+/** Append Savely UTM tracking params to an outbound provider URL. */
+function withUtm(url: string, brandName: string): string {
+  const sep = url.includes("?") ? "&" : "?";
+  const campaign = encodeURIComponent(brandName);
+  return `${url}${sep}utm_source=savely&utm_medium=partner&utm_campaign=${campaign}`;
+}
+
 export async function runCardCenterCron(env: CronEnv) {
   const sql = getDb(env);
 
@@ -164,7 +171,7 @@ export async function runCardCenterCron(env: CronEnv) {
       inStock: prev.inStock || inStock,
     });
 
-    const productUrl = `https://cardcenter.cc/shop/gift-cards/${providerBrandSlug}`;
+    const productUrl = withUtm(`https://cardcenter.cc/shop/gift-cards/${providerBrandSlug}`, providerBrandName);
 
     await sql/* sql */ `
       insert into provider_brand_products
@@ -376,8 +383,7 @@ export async function runCardDepotCron(env: CronEnv) {
 
     if (!brandId) continue;
 
-    const utmCampaign = encodeURIComponent(q || title || slug);
-    const productUrl = `https://carddepot.com/brands/${slug}?utm_source=savely&utm_medium=partner&utm_campaign=${utmCampaign}`;
+    const productUrl = withUtm(`https://carddepot.com/brands/${slug}`, q || title || slug);
     const maxDiscountPercent = Math.max(0, discount);
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
@@ -579,7 +585,7 @@ export async function runCardCookieCron(env: CronEnv) {
     const providerBrandName = chosenName || externalId.replace(/-/g, " ");
     const variant = mapVariantFromStrings(providerBrandName, title);
     const inStock = true; // appears on homepage
-    const productUrl = `https://cardcookie.com/${path}`;
+    const productUrl = withUtm(`https://cardcookie.com/${path}`, providerBrandName);
 
     // Prefer existing brand strictly by external id; only create new pending
     // brands when we see a slug we've never stored before.
@@ -890,12 +896,17 @@ export async function runGcxCron(env: CronEnv) {
         inStock: prev.inStock || inStock,
       });
 
+      // Ensure stored URL has UTM tracking
+      const baseGcxUrl = productUrl.split("?")[0];
+      const trackedGcxUrl = withUtm(baseGcxUrl, slug.replace(/-/g, " "));
+
       await sql/* sql */ `
         update provider_brand_products
         set
           is_active = ${inStock},
           last_seen_at = ${nowTs},
-          last_checked_at = ${nowTs}
+          last_checked_at = ${nowTs},
+          product_url = ${trackedGcxUrl}
         where provider_id = ${providerId}
           and brand_id = ${brandId}
       `;
@@ -1066,6 +1077,27 @@ export async function runArbitrageCron(env: CronEnv) {
         in_stock = excluded.in_stock,
         fetched_at = excluded.fetched_at
     `;
+
+    // Ensure stored URLs have UTM tracking
+    // First, get existing product URLs for this brand to append UTMs
+    const arbProducts = await sql/* sql */ `
+      select product_url from provider_brand_products
+      where provider_id = ${providerId} and brand_id = ${brandId}
+        and product_url is not null
+        and product_url not like '%utm_source=savely%'
+      limit 1
+    `;
+    for (const ap of arbProducts as any[]) {
+      const rawUrl = String(ap.product_url ?? "");
+      if (rawUrl) {
+        const trackedUrl = withUtm(rawUrl.split("?")[0], baseDomain);
+        await sql/* sql */ `
+          update provider_brand_products
+          set product_url = ${trackedUrl}
+          where provider_id = ${providerId} and brand_id = ${brandId}
+        `;
+      }
+    }
 
     await sql/* sql */ `
       update provider_brand_products
