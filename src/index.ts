@@ -477,10 +477,9 @@ app.get("/categories", async (c) => {
         count(distinct b.id) as brand_count,
         max(pbd.max_discount_percent) as max_discount
       from brands b
-      join provider_brand_discounts pbd on pbd.brand_id = b.id
+      left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
       where b.status = 'active'
         and b.category_id is not null
-        and pbd.in_stock = true
       group by b.category_id
     ) stats on stats.category_id = c.id
     order by c.display_order asc
@@ -552,6 +551,7 @@ app.get("/categories/:slug", async (c) => {
 
   const pageParam = c.req.query("page") || "1";
   const pageSizeParam = c.req.query("page_size") || "24";
+  const sortParam = c.req.query("sort") || "best_match";
 
   const pageRaw = Number.parseInt(pageParam, 10);
   const pageSizeRaw = Number.parseInt(pageSizeParam, 10);
@@ -562,35 +562,46 @@ app.get("/categories/:slug", async (c) => {
     : 24;
   const offset = (page - 1) * pageSize;
 
-  // Run stats and brand queries in parallel — both only need categoryRow.id
-  const [statsRow, brandRows] = await Promise.all([
-    sql/* sql */ `
-      select
-        count(distinct b.id) as total,
-        max(pbd.max_discount_percent) as max_discount
-      from brands b
-      left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
-      where b.category_id = ${categoryRow.id}
-        and b.status = 'active'
-    `,
-    sql/* sql */ `
-      select
-        b.id,
-        b.name,
-        b.slug,
-        b.base_domain,
-        max(pbd.max_discount_percent) as max_discount_percent,
-        bool_or(pbd.in_stock) as in_stock
-      from brands b
-      left join provider_brand_discounts pbd on pbd.brand_id = b.id
-      where b.category_id = ${categoryRow.id}
-        and b.status = 'active'
-      group by b.id, b.name, b.slug, b.base_domain
-      order by b.name asc
-      limit ${pageSize}
-      offset ${offset}
-    `,
-  ]);
+  // Run stats and brand queries in parallel
+  const statsQuery = sql/* sql */ `
+    select
+      count(distinct b.id) as total,
+      max(pbd.max_discount_percent) as max_discount
+    from brands b
+    left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+    where b.category_id = ${categoryRow.id}
+      and b.status = 'active'
+  `;
+
+  // Use separate queries per sort to avoid dynamic ORDER BY (Neon driver limitation)
+  const brandQuery =
+    sortParam === "az"
+      ? sql/* sql */ `
+          select
+            b.id, b.name, b.slug, b.base_domain,
+            max(pbd.max_discount_percent) as max_discount_percent,
+            coalesce(bool_or(pbd.in_stock), false) as in_stock
+          from brands b
+          left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+          where b.category_id = ${categoryRow.id} and b.status = 'active'
+          group by b.id, b.name, b.slug, b.base_domain
+          order by b.name asc
+          limit ${pageSize} offset ${offset}
+        `
+      : sql/* sql */ `
+          select
+            b.id, b.name, b.slug, b.base_domain,
+            max(pbd.max_discount_percent) as max_discount_percent,
+            coalesce(bool_or(pbd.in_stock), false) as in_stock
+          from brands b
+          left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+          where b.category_id = ${categoryRow.id} and b.status = 'active'
+          group by b.id, b.name, b.slug, b.base_domain
+          order by max(pbd.max_discount_percent) desc nulls last, b.name asc
+          limit ${pageSize} offset ${offset}
+        `;
+
+  const [statsRow, brandRows] = await Promise.all([statsQuery, brandQuery]);
 
   const total =
     typeof (statsRow[0] as any)?.total === "number"
@@ -695,9 +706,12 @@ app.get("/popular-brands", async (c) => {
       bv.slug,
       bv.base_domain,
       bv.event_count,
-      coalesce(bd.max_discount, 0) as max_discount_percent
+      coalesce(bd.max_discount, 0) as max_discount_percent,
+      c.name as category_name
     from brand_views bv
     left join brand_discounts bd on bd.brand_id = bv.brand_id
+    left join brands b on b.id = bv.brand_id
+    left join categories c on c.id = b.category_id
     order by bv.event_count desc
     limit ${limit}
   `;
@@ -707,6 +721,7 @@ app.get("/popular-brands", async (c) => {
     name: r.name as string,
     slug: r.slug as string,
     base_domain: (r.base_domain as string | null) ?? null,
+    category_name: (r.category_name as string | null) ?? null,
     event_count:
       typeof r.event_count === "number" ? r.event_count : Number(r.event_count),
     max_discount_percent:

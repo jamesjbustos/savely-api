@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 17.7 (bdd1736)
--- Dumped by pg_dump version 17.7 (bdd1736)
+-- Dumped from database version 17.8 (6108b59)
+-- Dumped by pg_dump version 17.8 (6108b59)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -360,7 +360,8 @@ CREATE TABLE public.extension_events (
     browser text,
     metadata jsonb DEFAULT '{}'::jsonb,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT chk_extension_events_type CHECK ((event_type = ANY (ARRAY['offer_click'::text, 'offer_impression'::text, 'modal_opened'::text, 'side_tab_click'::text])))
+    page_type text,
+    CONSTRAINT chk_extension_events_type CHECK ((event_type = ANY (ARRAY['offer_click'::text, 'offer_impression'::text, 'modal_opened'::text, 'modal_shown'::text, 'side_tab_click'::text, 'side_tab_shown'::text])))
 );
 
 
@@ -779,6 +780,13 @@ CREATE INDEX idx_extension_events_created ON public.extension_events USING btree
 --
 
 CREATE INDEX idx_extension_events_domain ON public.extension_events USING btree (domain) WHERE (domain IS NOT NULL);
+
+
+--
+-- Name: idx_extension_events_page_type; Type: INDEX; Schema: public; Owner: neondb_owner
+--
+
+CREATE INDEX idx_extension_events_page_type ON public.extension_events USING btree (page_type);
 
 
 --
