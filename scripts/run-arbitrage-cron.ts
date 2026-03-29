@@ -15,7 +15,9 @@ async function main() {
   await runArbitrageCron(env);
 }
 
-main().catch((err) => {
-  console.error("ArbitrageCard cron failed:", err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("ArbitrageCard cron failed:", err);
+    process.exit(1);
+  });
