@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { chromium } from "playwright";
-import { neon } from "@neondatabase/serverless";
+import postgres from "postgres";
 
 function loadDevVarsIfPresent() {
   const devVarsPath = resolve(process.cwd(), ".dev.vars");
@@ -245,7 +245,7 @@ async function main() {
     process.exit(1);
   }
 
-  const sql = neon(databaseUrl);
+  const sql = postgres(databaseUrl);
 
   const providerSlug = "cardcash";
   const providerName = "CardCash";

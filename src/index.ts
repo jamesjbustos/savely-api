@@ -274,8 +274,8 @@ app.get("/brands", async (c) => {
     brands.sort((a, b) => {
       const aRaw = a.last_deal_updated || a.created_at;
       const bRaw = b.last_deal_updated || b.created_at;
-      const aDate = aRaw instanceof Date ? aRaw.toISOString() : (aRaw || "");
-      const bDate = bRaw instanceof Date ? bRaw.toISOString() : (bRaw || "");
+      const aDate = String(aRaw || "");
+      const bDate = String(bRaw || "");
       if (bDate !== aDate) return bDate.localeCompare(aDate);
       return a.name.localeCompare(b.name);
     });

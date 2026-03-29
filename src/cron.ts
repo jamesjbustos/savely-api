@@ -147,7 +147,7 @@ export async function runCardCenterCron(env: CronEnv) {
       ) {
         await sql/* sql */ `
           insert into brand_aliases (brand_id, alias)
-          values (${brandId}, ${providerBrandName})
+          values (${brandId!}, ${providerBrandName})
           on conflict do nothing
         `;
       }
@@ -375,7 +375,7 @@ export async function runCardDepotCron(env: CronEnv) {
       if (title && title.toLowerCase() !== normalizedName.toLowerCase()) {
         await sql/* sql */ `
           insert into brand_aliases (brand_id, alias)
-          values (${brandId}, ${title})
+          values (${brandId!}, ${title})
           on conflict do nothing
         `;
       }
@@ -616,7 +616,7 @@ export async function runCardCookieCron(env: CronEnv) {
       ) {
         await sql/* sql */ `
           insert into brand_aliases (brand_id, alias)
-          values (${brandId}, ${providerBrandName})
+          values (${brandId!}, ${providerBrandName})
           on conflict do nothing
         `;
       }
