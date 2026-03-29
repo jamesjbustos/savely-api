@@ -1,6 +1,6 @@
-import { neon } from "@neondatabase/serverless";
+import postgres from "postgres";
 
 export function getDb(env: { DATABASE_URL: string; HYPERDRIVE?: { connectionString: string } }) {
   const connectionString = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL;
-  return neon(connectionString);
+  return postgres(connectionString);
 }
