@@ -563,12 +563,15 @@ app.get("/categories/:slug", async (c) => {
   const offset = (page - 1) * pageSize;
 
   // Run stats and brand queries in parallel
+  // Use the v_brand_provider_offers view so that product-level overrides
+  // (provider_brand_products.is_active / discount_percent) are respected,
+  // matching the logic on brand detail pages.
   const statsQuery = sql/* sql */ `
     select
       count(distinct b.id) as total,
-      max(pbd.max_discount_percent) as max_discount
+      max(v.max_discount_percent) as max_discount
     from brands b
-    left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+    left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
     where b.category_id = ${categoryRow.id}
       and b.status = 'active'
   `;
@@ -579,10 +582,10 @@ app.get("/categories/:slug", async (c) => {
       ? sql/* sql */ `
           select
             b.id, b.name, b.slug, b.base_domain,
-            max(pbd.max_discount_percent) as max_discount_percent,
-            coalesce(bool_or(pbd.in_stock), false) as in_stock
+            max(v.max_discount_percent) as max_discount_percent,
+            coalesce(bool_or(v.in_stock), false) as in_stock
           from brands b
-          left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
           where b.category_id = ${categoryRow.id} and b.status = 'active'
           group by b.id, b.name, b.slug, b.base_domain
           order by b.name asc
@@ -591,13 +594,13 @@ app.get("/categories/:slug", async (c) => {
       : sql/* sql */ `
           select
             b.id, b.name, b.slug, b.base_domain,
-            max(pbd.max_discount_percent) as max_discount_percent,
-            coalesce(bool_or(pbd.in_stock), false) as in_stock
+            max(v.max_discount_percent) as max_discount_percent,
+            coalesce(bool_or(v.in_stock), false) as in_stock
           from brands b
-          left join provider_brand_discounts pbd on pbd.brand_id = b.id and pbd.in_stock = true
+          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
           where b.category_id = ${categoryRow.id} and b.status = 'active'
           group by b.id, b.name, b.slug, b.base_domain
-          order by max(pbd.max_discount_percent) desc nulls last, b.name asc
+          order by max(v.max_discount_percent) desc nulls last, b.name asc
           limit ${pageSize} offset ${offset}
         `;
 
