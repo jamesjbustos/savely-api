@@ -18,6 +18,21 @@ function withUtm(url: string, brandName: string): string {
   return `${url}${sep}utm_source=savely&utm_medium=partner&utm_campaign=${campaign}`;
 }
 
+const CARD_DEPOT_LINKSYNERGY_SITE_ID = "boIinK7DrQw";
+const CARD_DEPOT_LINKSYNERGY_OFFER_ID = "2011365.4";
+const CARD_DEPOT_LINKSYNERGY_TYPE = "3";
+const CARD_DEPOT_LINKSYNERGY_SUB_ID = "0";
+
+function buildCardDepotProductUrl(): string {
+  return `https://click.linksynergy.com/fs-bin/click?id=${encodeURIComponent(
+    CARD_DEPOT_LINKSYNERGY_SITE_ID
+  )}&offerid=${encodeURIComponent(
+    CARD_DEPOT_LINKSYNERGY_OFFER_ID
+  )}&type=${encodeURIComponent(
+    CARD_DEPOT_LINKSYNERGY_TYPE
+  )}&subid=${encodeURIComponent(CARD_DEPOT_LINKSYNERGY_SUB_ID)}`;
+}
+
 export async function runCardCenterCron(env: CronEnv) {
   const sql = getDb(env);
 
@@ -347,7 +362,6 @@ export async function runCardDepotCron(env: CronEnv) {
 
     const isStock = Boolean(item?.is_stock);
     const discount = Number(item?.discount ?? 0) || 0;
-    const q = String(item?.q ?? "").trim();
 
     // Prefer existing brand strictly by external id; only create new pending
     // brands when we see a slug we've never stored before.
@@ -383,7 +397,7 @@ export async function runCardDepotCron(env: CronEnv) {
 
     if (!brandId) continue;
 
-    const productUrl = withUtm(`https://carddepot.com/brands/${slug}`, q || title || slug);
+    const productUrl = buildCardDepotProductUrl();
     const maxDiscountPercent = Math.max(0, discount);
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
