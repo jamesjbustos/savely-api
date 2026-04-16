@@ -19,18 +19,26 @@ function withUtm(url: string, brandName: string): string {
 }
 
 const CARD_DEPOT_LINKSYNERGY_SITE_ID = "boIinK7DrQw";
-const CARD_DEPOT_LINKSYNERGY_OFFER_ID = "2011365.4";
-const CARD_DEPOT_LINKSYNERGY_TYPE = "3";
+const CARD_DEPOT_LINKSYNERGY_MID = "54136";
+const CARD_DEPOT_LINKSYNERGY_OFFER_ID = "2011365";
+const CARD_DEPOT_LINKSYNERGY_TYPE = "2";
 const CARD_DEPOT_LINKSYNERGY_SUB_ID = "0";
 
-function buildCardDepotProductUrl(): string {
-  return `https://click.linksynergy.com/fs-bin/click?id=${encodeURIComponent(
+function buildCardDepotProductUrl(slug: string): string {
+  const cleanedSlug = String(slug ?? "").replace(/^\/+/, "");
+  const rawUrl = cleanedSlug
+    ? `https://carddepot.com/brands/${cleanedSlug}`
+    : "https://carddepot.com/brands";
+
+  return `https://click.linksynergy.com/link?id=${encodeURIComponent(
     CARD_DEPOT_LINKSYNERGY_SITE_ID
   )}&offerid=${encodeURIComponent(
     CARD_DEPOT_LINKSYNERGY_OFFER_ID
+  )}.${encodeURIComponent(
+    CARD_DEPOT_LINKSYNERGY_MID
   )}&type=${encodeURIComponent(
     CARD_DEPOT_LINKSYNERGY_TYPE
-  )}&subid=${encodeURIComponent(CARD_DEPOT_LINKSYNERGY_SUB_ID)}`;
+  )}&murl=${encodeURIComponent(rawUrl)}`;
 }
 
 export async function runCardCenterCron(env: CronEnv) {
@@ -397,7 +405,7 @@ export async function runCardDepotCron(env: CronEnv) {
 
     if (!brandId) continue;
 
-    const productUrl = buildCardDepotProductUrl();
+    const productUrl = buildCardDepotProductUrl(slug);
     const maxDiscountPercent = Math.max(0, discount);
     const prev = brandDiscounts.get(brandId) ?? {
       maxDiscount: 0,
