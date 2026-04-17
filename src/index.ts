@@ -6,7 +6,48 @@ type Env = {
   DATABASE_URL: string;
   EXTENSION_API_KEY: string;
   HYPERDRIVE?: { connectionString: string };
+  KV?: KVNamespace;
+  AXIOM_TOKEN?: string;
+  AXIOM_DATASET?: string;
+  CRON_SECRET?: string;
 };
+
+interface KVNamespace {
+  get(key: string, type?: "text"): Promise<string | null>;
+  get(key: string, type: "json"): Promise<unknown>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+}
+
+// Fire-and-forget ingest to Axiom. Batched events get sent as a single POST.
+async function ingestToAxiom(
+  env: Env,
+  events: Record<string, unknown>[],
+): Promise<void> {
+  const token = env.AXIOM_TOKEN;
+  const dataset = env.AXIOM_DATASET;
+  if (!token || !dataset || events.length === 0) return;
+
+  try {
+    const resp = await fetch(
+      `https://api.axiom.co/v1/datasets/${encodeURIComponent(dataset)}/ingest`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(events),
+      },
+    );
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error("[axiom] ingest failed:", resp.status, errText);
+    }
+  } catch (err) {
+    console.error("[axiom] ingest error:", err);
+  }
+}
+
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -147,15 +188,7 @@ app.get("/brands", async (c) => {
     : 24;
 
   const rows = await sql/* sql */ `
-    with brand_views as (
-      select
-        v.brand_id,
-        count(*) as view_count
-      from brand_daily_viewers v
-      where v.created_at >= now() - interval '30 days'
-      group by v.brand_id
-    ),
-    latest_deal_change as (
+    with latest_deal_change as (
       select
         brand_id,
         max(observed_at) as last_deal_updated
@@ -172,13 +205,11 @@ app.get("/brands", async (c) => {
       ldc.last_deal_updated,
       max(v.max_discount_percent) as best_discount,
       bool_or(v.in_stock) as in_stock,
-      coalesce(bv.view_count, 0) as view_count,
       c.id as category_id,
       c.name as category_name,
       c.slug as category_slug
     from v_brand_provider_offers v
     join brands b on b.id = v.brand_id
-    left join brand_views bv on bv.brand_id = v.brand_id
     left join latest_deal_change ldc on ldc.brand_id = v.brand_id
     left join categories c on c.id = b.category_id
     where b.status = 'active'
@@ -206,7 +237,6 @@ app.get("/brands", async (c) => {
       b.description,
       b.created_at,
       ldc.last_deal_updated,
-      bv.view_count,
       c.id,
       c.name,
       c.slug
@@ -225,7 +255,6 @@ app.get("/brands", async (c) => {
     last_deal_updated: string | null;
     best_discount: number | string | null;
     in_stock: boolean;
-    view_count: number | string | null;
     category_id: string | null;
     category_name: string | null;
     category_slug: string | null;
@@ -238,13 +267,6 @@ app.get("/brands", async (c) => {
         : typeof r.best_discount === "number"
         ? r.best_discount
         : Number(r.best_discount);
-    const viewCountRaw = r.view_count;
-    const viewCount =
-      typeof viewCountRaw === "number"
-        ? viewCountRaw
-        : viewCountRaw == null
-        ? 0
-        : Number(viewCountRaw);
 
     const category = r.category_id
       ? {
@@ -264,7 +286,6 @@ app.get("/brands", async (c) => {
       last_deal_updated: r.last_deal_updated ?? null,
       max_discount_percent: bestDiscount,
       in_stock: !!r.in_stock,
-      view_count: viewCount,
       category,
     };
   });
@@ -294,10 +315,8 @@ app.get("/brands", async (c) => {
       return a.name.localeCompare(b.name);
     });
   } else if (sortParam === "relevance") {
+    // Without view counts, relevance falls back to best discount
     brands.sort((a, b) => {
-      const av = a.view_count ?? 0;
-      const bv = b.view_count ?? 0;
-      if (bv !== av) return bv - av;
       const ad = a.max_discount_percent ?? 0;
       const bd = b.max_discount_percent ?? 0;
       if (bd !== ad) return bd - ad;
@@ -320,7 +339,7 @@ app.get("/brands", async (c) => {
     brands: paginated,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // GET /brands/:slug
@@ -448,7 +467,7 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // GET /categories
@@ -660,62 +679,56 @@ app.get("/categories/:slug", async (c) => {
     brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
-// GET /popular-brands?window_hours=24&limit=20
-// Returns brands ordered by how many unique viewers they had
-// in the last N hours (default 24), based solely on brand_daily_viewers.
+// GET /popular-brands?limit=20
+// Returns popular brands from pre-computed KV data (populated by scheduled cron).
+// Falls back to top-discount brands if KV data isn't available yet.
 app.get("/popular-brands", async (c) => {
-  const sql = getDb(c.env);
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
 
-  const windowParam = c.req.query("window_hours") || "24";
   const limitParam = c.req.query("limit") || "20";
-
-  const windowHoursRaw = Number.parseInt(windowParam, 10);
   const limitRaw = Number.parseInt(limitParam, 10);
-
-  const windowHours = Number.isFinite(windowHoursRaw)
-    ? Math.min(Math.max(windowHoursRaw, 1), 168)
-    : 24;
   const limit = Number.isFinite(limitRaw)
     ? Math.min(Math.max(limitRaw, 1), 100)
     : 20;
 
+  // Try KV first (pre-computed by scheduled cron from Analytics Engine)
+  const kv = c.env.KV;
+  if (kv) {
+    const kvData = await kv.get("popular-brands", "json") as any;
+    if (kvData && Array.isArray(kvData.brands)) {
+      const brands = kvData.brands.slice(0, limit);
+      const response = c.json({
+        window_hours: kvData.window_hours ?? 24,
+        limit,
+        brands,
+        source: "analytics_engine",
+        computed_at: kvData.computed_at ?? null,
+      });
+      return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
+    }
+  }
+
+  // Fallback: return top-discount brands (no brand_daily_viewers query)
+  const sql = getDb(c.env);
   const rows = await sql/* sql */ `
-    with brand_views as (
-      select
-        b.id as brand_id,
-        b.name,
-        b.slug,
-        b.base_domain,
-        count(*) as event_count
-      from brand_daily_viewers v
-      join brands b on b.id = v.brand_id
-      where v.created_at >= now() - (${windowHours} * interval '1 hour')
-      group by b.id, b.name, b.slug, b.base_domain
-    ),
-    brand_discounts as (
-      select
-        pbd.brand_id,
-        max(pbd.max_discount_percent) as max_discount
-      from provider_brand_discounts pbd
-      where pbd.in_stock = true
-      group by pbd.brand_id
-    )
-    select
-      bv.brand_id,
-      bv.name,
-      bv.slug,
-      bv.base_domain,
-      bv.event_count,
-      coalesce(bd.max_discount, 0) as max_discount_percent,
+    select distinct on (b.id)
+      b.id as brand_id,
+      b.name,
+      b.slug,
+      b.base_domain,
+      pbd.max_discount_percent,
       c.name as category_name
-    from brand_views bv
-    left join brand_discounts bd on bd.brand_id = bv.brand_id
-    left join brands b on b.id = bv.brand_id
+    from provider_brand_discounts pbd
+    join brands b on b.id = pbd.brand_id
     left join categories c on c.id = b.category_id
-    order by bv.event_count desc
+    where pbd.in_stock = true
+      and b.status = 'active'
+      and pbd.max_discount_percent > 0
+    order by b.id, pbd.max_discount_percent desc
     limit ${limit}
   `;
 
@@ -725,19 +738,21 @@ app.get("/popular-brands", async (c) => {
     slug: r.slug as string,
     base_domain: (r.base_domain as string | null) ?? null,
     category_name: (r.category_name as string | null) ?? null,
-    event_count:
-      typeof r.event_count === "number" ? r.event_count : Number(r.event_count),
+    event_count: 0,
     max_discount_percent:
       typeof r.max_discount_percent === "number"
         ? r.max_discount_percent
         : Number(r.max_discount_percent) || 0,
   }));
 
-  return c.json({
-    window_hours: windowHours,
+  const response = c.json({
+    window_hours: 24,
     limit,
     brands,
+    source: "fallback",
   });
+
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // GET /analytics/biggest-price-drops?window_hours=24&limit=20
@@ -888,98 +903,79 @@ app.get("/analytics/biggest-price-drops", async (c) => {
     brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
-// GET /analytics/popular-giftcards?window_hours=24&limit=20
-// Popular brands based on recent viewers, restricted to brands that currently
-// have live offers, and annotated with best current discount.
+// GET /analytics/popular-giftcards?limit=20
+// Popular brands from pre-computed KV data, filtered to brands with live offers.
 app.get("/analytics/popular-giftcards", async (c) => {
   const { cache, cacheKey, cached } = await getCached(c.req.url);
   if (cached) return cached;
 
-  const sql = getDb(c.env);
-
-  const windowParam = c.req.query("window_hours") || "24";
   const limitParam = c.req.query("limit") || "20";
-
-  const windowHoursRaw = Number.parseInt(windowParam, 10);
   const limitRaw = Number.parseInt(limitParam, 10);
-
-  const windowHours = Number.isFinite(windowHoursRaw)
-    ? Math.min(Math.max(windowHoursRaw, 1), 168)
-    : 24;
   const limit = Number.isFinite(limitRaw)
     ? Math.min(Math.max(limitRaw, 1), 100)
     : 20;
 
+  // Read from KV (same data as /popular-brands, already filtered to in-stock brands)
+  const kv = c.env.KV;
+  if (kv) {
+    const kvData = await kv.get("popular-brands", "json") as any;
+    if (kvData && Array.isArray(kvData.brands)) {
+      const brands = kvData.brands.slice(0, limit).map((b: any) => ({
+        brand_id: b.id,
+        brand_name: b.name,
+        brand_slug: b.slug,
+        base_domain: b.base_domain,
+        view_count: b.event_count ?? 0,
+        best_discount_percent: b.max_discount_percent,
+      }));
+
+      const response = c.json({
+        window_hours: kvData.window_hours ?? 24,
+        limit,
+        brands,
+      });
+      return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
+    }
+  }
+
+  // Fallback: top discounts (no brand_daily_viewers query)
+  const sql = getDb(c.env);
   const rows = await sql/* sql */ `
-    with base_popular as (
-      select
-        b.id as brand_id,
-        b.name as brand_name,
-        b.slug as brand_slug,
-        b.base_domain,
-        count(*) as view_count
-      from brand_daily_viewers v
-      join brands b on b.id = v.brand_id
-      where v.created_at >= now() - (${windowHours} * interval '1 hour')
-      group by b.id, b.name, b.slug, b.base_domain
-    ),
-    brand_best_discounts as (
-      select
-        v.brand_id,
-        max(v.max_discount_percent) as best_discount
-      from v_brand_provider_offers v
-      join brands b on b.id = v.brand_id
-      where v.in_stock = true
-        and b.status = 'active'
-      group by v.brand_id
-    )
-    select
-      p.brand_id,
-      p.brand_name,
-      p.brand_slug,
-      p.base_domain,
-      p.view_count,
-      d.best_discount
-    from base_popular p
-    join brand_best_discounts d on d.brand_id = p.brand_id
-    order by p.view_count desc
+    select distinct on (b.id)
+      b.id as brand_id,
+      b.name as brand_name,
+      b.slug as brand_slug,
+      b.base_domain,
+      v.max_discount_percent as best_discount
+    from v_brand_provider_offers v
+    join brands b on b.id = v.brand_id
+    where v.in_stock = true and b.status = 'active'
+    order by b.id, v.max_discount_percent desc
     limit ${limit}
   `;
 
-  type Row = {
-    brand_id: string;
-    brand_name: string;
-    brand_slug: string;
-    base_domain: string | null;
-    view_count: number | string;
-    best_discount: number | string | null;
-  };
-
-  const brands = (rows as any as Row[]).map((r) => ({
+  const brands = (rows as any[]).map((r) => ({
     brand_id: r.brand_id,
     brand_name: r.brand_name,
     brand_slug: r.brand_slug,
     base_domain: (r.base_domain as string | null) ?? null,
-    view_count:
-      typeof r.view_count === "number" ? r.view_count : Number(r.view_count),
+    view_count: 0,
     best_discount_percent:
-      r.best_discount == null
-        ? null
-        : typeof r.best_discount === "number"
-        ? r.best_discount
+      r.best_discount == null ? null
+        : typeof r.best_discount === "number" ? r.best_discount
         : Number(r.best_discount),
   }));
 
   const response = c.json({
-    window_hours: windowHours,
+    window_hours: 24,
     limit,
     brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // GET /analytics/top-discounts?limit=20
@@ -1047,7 +1043,7 @@ app.get("/analytics/top-discounts", async (c) => {
     brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // GET /analytics/live-offers?window_hours=168
@@ -1156,7 +1152,7 @@ app.get("/analytics/live-offers", async (c) => {
     current_total_live_offers: currentTotal,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 30);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
 // API key protection for extension-only endpoints.
@@ -1182,6 +1178,9 @@ for (const path of protectedPaths) {
 // This is used by the extension to pre-filter which pages are eligible
 // for offer lookups, and is safe to cache for a long time.
 app.get("/brand-domains", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
 
   const rows = await sql/* sql */ `
@@ -1211,16 +1210,14 @@ app.get("/brand-domains", async (c) => {
 
   const domains = (rows as any[]).map((r) => r.domain as string);
 
-  c.header("Cache-Control", "public, max-age=86400");
+  const response = c.json({ domains });
 
-  return c.json({ domains });
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 86400, 86400);
 });
 
 // POST /feedback
-// Collects user feedback from the browser extension.
+// Collects user feedback via Analytics Engine (no DB write).
 app.post("/feedback", async (c) => {
-  const sql = getDb(c.env);
-
   let body: {
     rating?: string;
     message?: string;
@@ -1236,21 +1233,28 @@ app.post("/feedback", async (c) => {
 
   const { rating, message, extensionVersion, browser } = body;
 
-  await sql/* sql */ `
-    INSERT INTO user_feedback (rating, message, extension_version, browser)
-    VALUES (${rating ?? null}, ${message ?? null}, ${
-    extensionVersion ?? null
-  }, ${browser ?? null})
-  `;
+  const feedbackEvent = {
+    _time: new Date().toISOString(),
+    event: "feedback",
+    rating: rating ?? null,
+    message: message ?? null,
+    extension_version: extensionVersion ?? null,
+    browser: browser ?? null,
+  };
+
+  if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
+    c.executionCtx.waitUntil(ingestToAxiom(c.env, [feedbackEvent]));
+  } else {
+    await ingestToAxiom(c.env, [feedbackEvent]);
+  }
 
   return c.json({ success: true });
 });
 
 // POST /events
-// Records extension analytics events (clicks, impressions, etc.)
+// Records extension analytics events via Cloudflare Analytics Engine.
+// No database writes - zero egress cost.
 app.post("/events", async (c) => {
-  const sql = getDb(c.env);
-
   const viewerId = c.req.header("x-viewer-id");
   if (!viewerId || !viewerId.trim()) {
     return c.json({ error: "Missing x-viewer-id header" }, 400);
@@ -1281,42 +1285,26 @@ app.post("/events", async (c) => {
     return c.json({ error: "Missing eventType" }, 400);
   }
 
-  const metadataJson =
-    body.metadata && Object.keys(body.metadata).length > 0
-      ? JSON.stringify(body.metadata)
-      : "{}";
-
-  // Fire-and-forget insert
-  const insertEvent = async () => {
-    try {
-      await sql/* sql */ `
-        INSERT INTO extension_events (
-          viewer_id, event_type, brand_id, provider_id, provider_slug,
-          domain, product_url, discount_percent, page_type, extension_version, browser, metadata
-        ) VALUES (
-          ${viewerId.trim()},
-          ${eventType},
-          ${body.brandId ?? null},
-          ${body.providerId ?? null},
-          ${body.providerSlug ?? null},
-          ${body.domain ?? null},
-          ${body.productUrl ?? null},
-          ${body.discountPercent ?? null},
-          ${body.pageType ?? null},
-          ${body.extensionVersion ?? null},
-          ${body.browser ?? null},
-          ${metadataJson}::jsonb
-        )
-      `;
-    } catch (err) {
-      console.error("Error inserting extension_event:", err);
-    }
+  const event = {
+    _time: new Date().toISOString(),
+    event: eventType,
+    viewer_id: viewerId.trim(),
+    brand_id: body.brandId ?? null,
+    provider_id: body.providerId ?? null,
+    provider_slug: body.providerSlug ?? null,
+    domain: body.domain ?? null,
+    product_url: body.productUrl ?? null,
+    discount_percent: body.discountPercent ?? null,
+    page_type: body.pageType ?? null,
+    extension_version: body.extensionVersion ?? null,
+    browser: body.browser ?? null,
+    metadata: body.metadata ?? {},
   };
 
   if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
-    c.executionCtx.waitUntil(insertEvent());
+    c.executionCtx.waitUntil(ingestToAxiom(c.env, [event]));
   } else {
-    await insertEvent();
+    await ingestToAxiom(c.env, [event]);
   }
 
   return c.json({ ok: true });
@@ -1395,25 +1383,20 @@ app.get("/offers", async (c) => {
       ? viewerIdHeader.trim()
       : null;
 
-  // Fire-and-forget analytics for extension traffic hitting a known brand.
-  // Only log unique daily viewers when a viewer_id is provided.
-  const logBrandEvent = async () => {
-    if (!viewerId) return;
-    try {
-      await sql/* sql */ `
-        insert into brand_daily_viewers (brand_id, viewer_id, day)
-        values (${canonicalBrand.id}, ${viewerId}, current_date)
-        on conflict (brand_id, viewer_id, day) do nothing
-      `;
-    } catch (err) {
-      console.error("Error logging brand_daily_viewers entry:", err);
+  // Log brand view to Axiom (replaces brand_daily_viewers DB writes).
+  if (viewerId) {
+    const viewEvent = {
+      _time: new Date().toISOString(),
+      event: "view",
+      viewer_id: viewerId,
+      brand_id: canonicalBrand.id,
+      brand_slug: canonicalBrand.slug,
+      brand_name: canonicalBrand.name,
+      domain,
+    };
+    if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
+      c.executionCtx.waitUntil(ingestToAxiom(c.env, [viewEvent]));
     }
-  };
-
-  if (c.executionCtx && typeof c.executionCtx.waitUntil === "function") {
-    c.executionCtx.waitUntil(logBrandEvent());
-  } else {
-    await logBrandEvent();
   }
 
   // Step 2: look up offers for:
@@ -1525,6 +1508,9 @@ app.get("/offers", async (c) => {
 // GET /brands/:slug/discount-history
 // Returns discount history for charting - both holistic max and per-provider
 app.get("/brands/:slug/discount-history", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
   const sql = getDb(c.env);
   const slug = c.req.param("slug");
 
@@ -1684,22 +1670,224 @@ app.get("/brands/:slug/discount-history", async (c) => {
   const holisticFilled = fillGaps(holisticRaw, allDates);
   const holistic = holisticFilled.map(({ date, discount }) => ({ date, discount }));
 
-  return c.json({
+  const response = c.json({
     brand_id: brandId,
     days,
     holistic,
     providers,
   });
+
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 3600, 7200);
+});
+
+// Scheduled handler: compute popular brands from Axiom → KV.
+// Runs every 15 minutes (configured in wrangler.jsonc triggers.crons).
+async function handleScheduled(env: Env) {
+  const kv = env.KV;
+  if (!kv) {
+    console.error("[cron] KV binding not available");
+    return;
+  }
+
+  const token = env.AXIOM_TOKEN;
+  const dataset = env.AXIOM_DATASET;
+
+  if (!token || !dataset) {
+    console.warn("[cron] AXIOM_TOKEN or AXIOM_DATASET not set, using DB fallback");
+    await computePopularBrandsFromDb(env, kv);
+    return;
+  }
+
+  try {
+    // APL query: top brands by view count in last 24h, combining extension + website views.
+    // Group by brand_slug (present in both sources). brand_id is only set by extension.
+    const apl = `['${dataset}']
+| where event == 'view'
+| where _time > ago(24h)
+| where isnotnull(brand_slug) and brand_slug != ''
+| summarize view_count = count() by brand_slug
+| order by view_count desc
+| take 100`;
+
+    const resp = await fetch("https://api.axiom.co/v1/datasets/_apl/query?format=tabular", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ apl }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error("[cron] Axiom query failed:", resp.status, errText);
+      await computePopularBrandsFromDb(env, kv);
+      return;
+    }
+
+    const result = await resp.json() as {
+      tables?: Array<{
+        columns: string[];
+        rows?: Array<Array<unknown>>;
+      }>;
+    };
+
+    const table = result.tables?.[0];
+    const columns = table?.columns ?? [];
+    const rows = table?.rows ?? [];
+
+    const brandSlugIdx = columns.indexOf("brand_slug");
+    const viewCountIdx = columns.indexOf("view_count");
+
+    const axiomRows: Array<{ brand_slug: string; view_count: number }> =
+      rows.map((row) => ({
+        brand_slug: String(row[brandSlugIdx] ?? ""),
+        view_count: Number(row[viewCountIdx] ?? 0),
+      })).filter((r) => r.brand_slug);
+
+    if (axiomRows.length === 0) {
+      console.warn("[cron] No Axiom data yet, falling back to DB");
+      await computePopularBrandsFromDb(env, kv);
+      return;
+    }
+
+    // Enrich with current discount data from Supabase, matched by slug
+    const sql = getDb(env);
+    const slugs = axiomRows.map((r) => r.brand_slug);
+
+    const discountRows = await sql/* sql */ `
+      select
+        b.id as brand_id,
+        b.name,
+        b.slug,
+        b.base_domain,
+        max(pbd.max_discount_percent) as max_discount,
+        c.name as category_name
+      from provider_brand_discounts pbd
+      join brands b on b.id = pbd.brand_id
+      left join categories c on c.id = b.category_id
+      where pbd.in_stock = true
+        and b.status = 'active'
+        and b.slug = any(${slugs})
+      group by b.id, b.name, b.slug, b.base_domain, c.name
+    `;
+
+    const discountMap = new Map<string, any>();
+    for (const r of discountRows as any[]) {
+      discountMap.set(r.slug, r);
+    }
+
+    const brands = axiomRows
+      .filter((r) => discountMap.has(r.brand_slug))
+      .map((r) => {
+        const d = discountMap.get(r.brand_slug)!;
+        return {
+          id: d.brand_id as string,
+          name: d.name as string,
+          slug: d.slug as string,
+          base_domain: (d.base_domain as string | null) ?? null,
+          category_name: (d.category_name as string | null) ?? null,
+          event_count: r.view_count,
+          max_discount_percent:
+            typeof d.max_discount === "number" ? d.max_discount : Number(d.max_discount) || 0,
+        };
+      });
+
+    await kv.put(
+      "popular-brands",
+      JSON.stringify({
+        window_hours: 24,
+        brands,
+        computed_at: new Date().toISOString(),
+      }),
+      { expirationTtl: 3600 }
+    );
+
+    console.log(`[cron] Computed popular brands from Axiom: ${brands.length} brands`);
+  } catch (err) {
+    console.error("[cron] Error computing popular brands:", err);
+    await computePopularBrandsFromDb(env, kv);
+  }
+}
+
+// Fallback: compute popular brands from DB (top discounts, no viewer data needed)
+async function computePopularBrandsFromDb(env: Env, kv: KVNamespace) {
+  try {
+    const sql = getDb(env);
+    const rows = await sql/* sql */ `
+      select distinct on (b.id)
+        b.id as brand_id,
+        b.name,
+        b.slug,
+        b.base_domain,
+        pbd.max_discount_percent,
+        c.name as category_name
+      from provider_brand_discounts pbd
+      join brands b on b.id = pbd.brand_id
+      left join categories c on c.id = b.category_id
+      where pbd.in_stock = true
+        and b.status = 'active'
+        and pbd.max_discount_percent > 0
+      order by b.id, pbd.max_discount_percent desc
+      limit 100
+    `;
+
+    const brands = (rows as any[]).map((r) => ({
+      id: r.brand_id as string,
+      name: r.name as string,
+      slug: r.slug as string,
+      base_domain: (r.base_domain as string | null) ?? null,
+      category_name: (r.category_name as string | null) ?? null,
+      event_count: 0,
+      max_discount_percent:
+        typeof r.max_discount_percent === "number"
+          ? r.max_discount_percent
+          : Number(r.max_discount_percent) || 0,
+    }));
+
+    await kv.put(
+      "popular-brands",
+      JSON.stringify({
+        window_hours: 24,
+        brands,
+        computed_at: new Date().toISOString(),
+        source: "db_fallback",
+      }),
+      { expirationTtl: 3600 }
+    );
+
+    console.log(`[cron] Computed popular brands from DB fallback: ${brands.length} brands`);
+  } catch (err) {
+    console.error("[cron] DB fallback also failed:", err);
+  }
+}
+
+// POST /internal/compute-popular-brands
+// Triggered by GitHub Actions cron. Protected by Bearer token (CRON_SECRET).
+app.post("/internal/compute-popular-brands", async (c) => {
+  const authHeader = c.req.header("authorization") || "";
+  const expected = `Bearer ${c.env.CRON_SECRET ?? ""}`;
+  if (!c.env.CRON_SECRET || authHeader !== expected) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await handleScheduled(c.env);
+  return c.json({ ok: true });
 });
 
 export default {
-  // Use minimal types for the platform context objects to avoid depending on
-  // Cloudflare's global TypeScript types in this entry file.
   fetch(
     request: Request,
     env: Env,
     ctx: { waitUntil(p: Promise<unknown>): void }
   ) {
     return app.fetch(request, env, ctx as any);
+  },
+
+  async scheduled(
+    _event: { cron: string; scheduledTime: number },
+    env: Env,
+    ctx: { waitUntil(p: Promise<unknown>): void }
+  ) {
+    ctx.waitUntil(handleScheduled(env));
   },
 };

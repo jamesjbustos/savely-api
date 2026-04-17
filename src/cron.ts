@@ -1535,12 +1535,6 @@ export async function runBrandCategoryCron(env: CategoryCronEnv) {
         where id = ${brandId}
       `;
 
-      // Log classification history with confidence
-      await sql/* sql */ `
-        insert into brand_classifications (brand_id, category_id, iab_category_raw, iab_confidence, source)
-        values (${brandId}, ${categoryId}, ${result.category}, ${result.confidence / 100}, 'google-search-claude')
-      `;
-
       console.log(
         `Brand category cron: "${brandName}" → ${result.category} (${result.confidence}%) | "${result.description.slice(0, 50)}..."`
       );

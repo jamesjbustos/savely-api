@@ -50,3 +50,10 @@ bruno/bruno-api-collection/*
 
 # legacy
 legacy/
+
+# Local DB snapshots / scratch data dumps
+brands*.json
+categories.json
+
+# IDE metadata
+.cursor/

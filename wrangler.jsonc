@@ -21,6 +21,15 @@
       "persist": true,
       "head_sampling_rate": 0.1
     }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "66ad293921d54eaa8859d5ac4befd993"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/15 * * * *"]
   }
   // "compatibility_flags": [
   //   "nodejs_compat"
