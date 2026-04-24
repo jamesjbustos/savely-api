@@ -1,5 +1,5 @@
 {
-  "name": "savely-api",
+  "name": "cardbay-api",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

@@ -1,5 +1,5 @@
 /**
- * Maps IAB v3 taxonomy category paths to Savely's internal category slugs.
+ * Maps IAB v3 taxonomy category paths to Cardbay's internal category slugs.
  *
  * IAB categories come from Klazify API in format like:
  * "/Food & Drink", "/Shopping/Consumer Electronics", etc.

@@ -11,11 +11,11 @@ type CronEnv = {
   DATABASE_URL: string;
 };
 
-/** Append Savely UTM tracking params to an outbound provider URL. */
+/** Append Cardbay UTM tracking params to an outbound provider URL. */
 function withUtm(url: string, brandName: string): string {
   const sep = url.includes("?") ? "&" : "?";
   const campaign = encodeURIComponent(brandName);
-  return `${url}${sep}utm_source=savely&utm_medium=partner&utm_campaign=${campaign}`;
+  return `${url}${sep}utm_source=cardbay&utm_medium=partner&utm_campaign=${campaign}`;
 }
 
 const CARD_DEPOT_LINKSYNERGY_SITE_ID = "boIinK7DrQw";
@@ -80,7 +80,7 @@ export async function runCardCenterCron(env: CronEnv) {
 
   // Fetch current snapshot from CardCenter API
   const res = await fetch("https://cardcenter.cc/Api/Shop/Brands", {
-    headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
+    headers: { "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)" },
   });
 
   if (!res.ok) {
@@ -317,7 +317,7 @@ export async function runCardDepotCron(env: CronEnv) {
 
   // Fetch current snapshot from CardDepot API
   const res = await fetch("https://carddepot.com/api/brands?type=savely", {
-    headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
+    headers: { "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)" },
   });
 
   if (!res.ok) {
@@ -539,7 +539,7 @@ export async function runCardCookieCron(env: CronEnv) {
 
   // Fetch homepage
   const res = await fetch("https://cardcookie.com/", {
-    headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
+    headers: { "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)" },
   });
 
   if (!res.ok) {
@@ -804,7 +804,7 @@ export async function runGcxCron(env: CronEnv) {
     let discounts: any[] = [];
     try {
       const resCb = await fetch("https://www.cardbear.com/api/json.php", {
-        headers: { "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)" },
+        headers: { "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)" },
       });
       if (!resCb.ok) {
         console.error(
@@ -876,7 +876,7 @@ export async function runGcxCron(env: CronEnv) {
           )}`;
           const res = await fetch(url, {
             headers: {
-              "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)",
+              "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)",
               accept: "application/json, text/plain, */*",
             },
           });
@@ -1044,7 +1044,7 @@ export async function runArbitrageCron(env: CronEnv) {
     try {
       const res = await fetch(url, {
         headers: {
-          "user-agent": "Mozilla/5.0 (compatible; SavelyBot/1.0)",
+          "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)",
           accept: "application/json, text/plain, */*",
         },
       });
@@ -1106,7 +1106,7 @@ export async function runArbitrageCron(env: CronEnv) {
       select product_url from provider_brand_products
       where provider_id = ${providerId} and brand_id = ${brandId}
         and product_url is not null
-        and product_url not like '%utm_source=savely%'
+        and product_url not like '%utm_source=cardbay%'
       limit 1
     `;
     for (const ap of arbProducts as any[]) {

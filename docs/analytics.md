@@ -5,7 +5,7 @@ How we track extension and website events without blowing up Supabase egress.
 ## Architecture
 
 ```
-Extension                      Website (trysavely.com)
+Extension                      Website (cardbay.co)
    ↓                              ↓
 savely-api (CF Worker)       Next.js /api/track
    ↓                              ↓
@@ -37,19 +37,19 @@ The new setup:
 
 ### Axiom
 - Account: jamesjbustos@gmail.com
-- Dataset: `savely_events` (30-day retention, US East 1)
-- Ingest endpoint: `https://api.axiom.co/v1/datasets/savely_events/ingest`
+- Dataset: `savely_events` (30-day retention, US East 1). A new `cardbay_events` dataset will be created at the Cardbay rebrand cutover and the Worker env will switch to it.
+- Ingest endpoint: `https://api.axiom.co/v1/datasets/savely_events/ingest` (will become `cardbay_events` at cutover)
 - Query endpoint: `https://api.axiom.co/v1/datasets/_apl/query`
 - Dashboard: https://app.axiom.co
 
 ### Cloudflare Worker
-- Worker: `savely-api` (account `901cf95153f15fa92fd91f2fc4a19c77`)
+- Worker: `savely-api` (internal name retained post-rebrand; served from `api.cardbay.co` once the custom domain is added) (account `901cf95153f15fa92fd91f2fc4a19c77`)
 - KV namespace: `KV` (id `66ad293921d54eaa8859d5ac4befd993`)
 - Cron: `*/15 * * * *` — invokes the `scheduled()` handler in `src/index.ts`
 
 ### Secrets (on the Worker)
-- `AXIOM_TOKEN` — Axiom API token with Ingest + Query on `savely_events`
-- `AXIOM_DATASET` — dataset name (`savely_events`)
+- `AXIOM_TOKEN` — Axiom API token with Ingest + Query on `savely_events` (will be reissued for `cardbay_events` at cutover)
+- `AXIOM_DATASET` — dataset name (`savely_events`; will switch to `cardbay_events` at cutover)
 
 ## Event schema
 

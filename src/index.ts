@@ -59,6 +59,8 @@ app.use(
     origin: [
       "https://trysavely.com",
       "https://www.trysavely.com",
+      "https://cardbay.co",
+      "https://www.cardbay.co",
       "http://localhost:3000",
       "http://localhost:3001",
     ],

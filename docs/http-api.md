@@ -50,9 +50,9 @@ The `/offers` endpoint uses the Cloudflare Worker `caches.default` API:
 
 - Cache key: the full request URL (method `GET`).
 - TTL: 30 seconds (`OFFERS_CACHE_TTL_MS = 30_000`).
-- Cached responses include a header `X-Savely-Cache-At` with a Unix timestamp in milliseconds.
+- Cached responses include a header `X-Cardbay-Cache-At` with a Unix timestamp in milliseconds.
 - Subsequent identical requests within 30 seconds are served from cache if:
-  - `Date.now() - X-Savely-Cache-At < 30_000`.
+  - `Date.now() - X-Cardbay-Cache-At < 30_000`.
 
 ## Endpoints
 
