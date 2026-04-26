@@ -57,10 +57,8 @@ app.use(
   "*",
   cors({
     origin: [
-      "https://trysavely.com",
-      "https://www.trysavely.com",
-      "https://cardbay.co",
-      "https://www.cardbay.co",
+      "https://carddeals.co",
+      "https://www.carddeals.co",
       "http://localhost:3000",
       "http://localhost:3001",
     ],

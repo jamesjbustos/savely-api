@@ -1,5 +1,5 @@
 {
-  "name": "cardbay-api",
+  "name": "carddeals-api",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

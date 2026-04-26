@@ -15,7 +15,7 @@ type CronEnv = {
 function withUtm(url: string, brandName: string): string {
   const sep = url.includes("?") ? "&" : "?";
   const campaign = encodeURIComponent(brandName);
-  return `${url}${sep}utm_source=cardbay&utm_medium=partner&utm_campaign=${campaign}`;
+  return `${url}${sep}utm_source=carddeals&utm_medium=partner&utm_campaign=${campaign}`;
 }
 
 const CARD_DEPOT_LINKSYNERGY_SITE_ID = "boIinK7DrQw";
@@ -1106,7 +1106,7 @@ export async function runArbitrageCron(env: CronEnv) {
       select product_url from provider_brand_products
       where provider_id = ${providerId} and brand_id = ${brandId}
         and product_url is not null
-        and product_url not like '%utm_source=cardbay%'
+        and product_url not like '%utm_source=carddeals%'
       limit 1
     `;
     for (const ap of arbProducts as any[]) {
