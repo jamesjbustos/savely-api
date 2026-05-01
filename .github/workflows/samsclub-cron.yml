@@ -1,0 +1,35 @@
+name: SamsClub Cron
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes
+  workflow_dispatch: {}
+
+jobs:
+  sync-samsclub:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Sam's Club cron
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RAKUTEN_CLIENT_ID: ${{ secrets.RAKUTEN_CLIENT_ID }}
+          RAKUTEN_CLIENT_SECRET: ${{ secrets.RAKUTEN_CLIENT_SECRET }}
+          RAKUTEN_SID: ${{ secrets.RAKUTEN_SID }}
+        run: pnpm exec tsx scripts/run-samsclub-cron.ts

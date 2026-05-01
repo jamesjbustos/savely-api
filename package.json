@@ -8,6 +8,7 @@
     "cron:cardcash": "node scripts/cron-cardcash.mjs",
     "cron:offer-inventory": "tsx scripts/run-offer-inventory-cron.ts",
     "cron:fast": "tsx scripts/run-fast-crons.ts",
+    "cron:samsclub": "tsx scripts/run-samsclub-cron.ts",
     "classify-brands": "tsx scripts/run-category-cron.ts"
   },
   "dependencies": {

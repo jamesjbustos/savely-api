@@ -11,6 +11,19 @@ type CronEnv = {
   DATABASE_URL: string;
 };
 
+type SamsClubCronEnv = CronEnv & {
+  RAKUTEN_CLIENT_ID: string;
+  RAKUTEN_CLIENT_SECRET: string;
+  RAKUTEN_SID: string; // publisher Site ID, used as OAuth scope
+};
+
+const SAMS_CLUB_MID = "38733";
+const SAMS_CLUB_PROVIDER_SLUG = "samsclub";
+const SAMS_CLUB_PROVIDER_NAME = "Sam's Club";
+const RAKUTEN_TOKEN_URL = "https://api.linksynergy.com/token";
+const RAKUTEN_PRODUCT_SEARCH_URL = "https://api.linksynergy.com/productsearch/1.0";
+const SAMS_CLUB_MAX_PAGES = 20; // hard cap; Sam's Club catalog is ~7 pages of 100
+
 /** Append Cardbay UTM tracking params to an outbound provider URL. */
 function withUtm(url: string, brandName: string): string {
   const sep = url.includes("?") ? "&" : "?";
@@ -1552,4 +1565,345 @@ export async function runBrandCategoryCron(env: CategoryCronEnv) {
   console.log(
     `Brand category cron: processed ${processed} brands, ${skippedLowConfidence} skipped (low confidence), ${errors} errors`
   );
+}
+
+// ---------------------------------------------------------------------------
+// Sam's Club cron
+// ---------------------------------------------------------------------------
+//
+// Pulls Sam's Club's gift card catalog from the Rakuten Advertising Product
+// Search API, matches each product to one of our existing brands using STRICT
+// normalized name/alias lookup (no substring or fuzzy matching — that's what
+// caused Applebee's to land on the Apple brand page in the original import),
+// and writes the single highest-discount offer per brand. Anything that does
+// not produce an exact normalized match is dropped.
+
+/**
+ * Strip Sam's-Club-isms ("Multi-Pack", "$50", "Email Delivery", etc.) from a
+ * product title to leave just the brand name. Returns lowercase, may include
+ * spaces and apostrophes — caller should pass the result through
+ * normalizeBrandKey() before lookup.
+ */
+function extractSamsClubBrandText(title: string): string {
+  let t = title.toLowerCase();
+  // Quantity / multi-pack patterns: "3 x $25", "2x$15", "3 x 25"
+  t = t.replace(/\b\d+\s*[x×]\s*\$?\d+(?:\.\d+)?\b/g, " ");
+  // Dollar amounts: "$50", "$100.00"
+  t = t.replace(/\$\s*\d+(?:\.\d+)?/g, " ");
+  // Standalone integer face values left after the $ stripping
+  t = t.replace(/\b\d{2,4}\b/g, " ");
+  // Marketing/format noise
+  t = t.replace(/\bemail delivery\b/g, " ");
+  t = t.replace(/\bdigital delivery\b/g, " ");
+  t = t.replace(/\bphysical (?:gift )?card\b/g, " ");
+  t = t.replace(/\bmulti[\s-]?pack\b/g, " ");
+  t = t.replace(/\bgift cards?\b/g, " ");
+  t = t.replace(/\begift\b/g, " ");
+  t = t.replace(/\bvalue add\b/g, " ");
+  t = t.replace(/\bvalue\b/g, " ");
+  t = t.replace(/\bbonus\b/g, " ");
+  t = t.replace(/\bnext gen\b/g, " ");
+  // Punctuation
+  t = t.replace(/[:,\-\(\)\/]+/g, " ");
+  return t.replace(/\s+/g, " ").trim();
+}
+
+/** Normalize a name so "Applebee's", "applebees", and "Apple Bee's" collapse to one key. */
+function normalizeBrandKey(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/['']/g, "")
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Pull a face value (e.g. 50 from "Olive Garden $50 Gift Card") from a Sam's Club product title. */
+function extractSamsClubFaceValue(title: string): number | null {
+  const dollarMatch = title.match(/\$\s*(\d+(?:\.\d+)?)/);
+  if (dollarMatch) {
+    const v = parseFloat(dollarMatch[1]);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+  // Fallback for titles like "Sam's Club Fuel Up Gift Card: - 75"
+  const numMatch = title.match(/[\s:\-]+(\d{2,4})(?:[\s:]|$)/);
+  if (numMatch) {
+    const v = parseFloat(numMatch[1]);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+  return null;
+}
+
+async function fetchSamsClubAccessToken(env: SamsClubCronEnv): Promise<string> {
+  const basicAuth = Buffer.from(
+    `${env.RAKUTEN_CLIENT_ID}:${env.RAKUTEN_CLIENT_SECRET}`
+  ).toString("base64");
+  const resp = await fetch(RAKUTEN_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basicAuth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: `grant_type=client_credentials&scope=${env.RAKUTEN_SID}`,
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Sam's Club cron: token fetch failed: ${resp.status} ${body}`);
+  }
+  const data = (await resp.json()) as { access_token?: string };
+  if (!data.access_token) {
+    throw new Error("Sam's Club cron: no access_token in response");
+  }
+  return data.access_token;
+}
+
+type SamsClubProduct = {
+  sku: string;
+  productName: string;
+  productUrl: string;
+  imageUrl: string;
+  price: number;
+  saleprice: number;
+};
+
+async function fetchSamsClubProductsPage(
+  accessToken: string,
+  pageNumber: number
+): Promise<{ products: SamsClubProduct[]; totalPages: number }> {
+  const url = `${RAKUTEN_PRODUCT_SEARCH_URL}?keyword=gift+card&mid=${SAMS_CLUB_MID}&max=100&pagenumber=${pageNumber}`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!resp.ok) {
+    throw new Error(
+      `Sam's Club cron: product fetch page ${pageNumber} failed: ${resp.status}`
+    );
+  }
+  const xml = await resp.text();
+  const $ = loadHtml(xml, { xmlMode: true });
+  const totalPages = parseInt($("TotalPages").text() || "1", 10) || 1;
+  const products: SamsClubProduct[] = [];
+  $("item").each((_idx, el) => {
+    const $item = $(el);
+    products.push({
+      sku: $item.find("sku").text().trim(),
+      productName: $item.find("productname").text().trim(),
+      productUrl: $item.find("linkurl").text().trim(),
+      imageUrl: $item.find("imageurl").text().trim(),
+      price: parseFloat($item.find("price").text() || "0") || 0,
+      saleprice: parseFloat($item.find("saleprice").text() || "0") || 0,
+    });
+  });
+  return { products, totalPages };
+}
+
+export async function runSamsClubCron(env: SamsClubCronEnv) {
+  const sql = getDb(env);
+
+  // 1) Ensure provider exists
+  await sql/* sql */ `
+    insert into providers (name, slug)
+    values (${SAMS_CLUB_PROVIDER_NAME}, ${SAMS_CLUB_PROVIDER_SLUG})
+    on conflict (slug) do nothing
+  `;
+  const providerRow = await sql/* sql */ `
+    select id from providers where slug = ${SAMS_CLUB_PROVIDER_SLUG} limit 1
+  `;
+  if (!providerRow?.[0]?.id) {
+    console.error("Sam's Club cron: failed to resolve provider id");
+    return;
+  }
+  const providerId = providerRow[0].id as string;
+
+  // 2) Build a strict brand lookup index from active brands + aliases.
+  //    Key = normalized lowercased token sequence. Values are brand_ids.
+  //    Strict equality only — never substring/fuzzy. Drop unmatched products.
+  const brandRows = await sql/* sql */ `
+    select id, name, slug from brands where status = 'active'
+  `;
+  const aliasRows = await sql/* sql */ `
+    select brand_id, alias from brand_aliases
+  `;
+
+  const brandIndex = new Map<string, string>();
+  for (const b of brandRows as any[]) {
+    const id = b.id as string;
+    const nameKey = normalizeBrandKey(b.name as string);
+    const slugKey = normalizeBrandKey(b.slug as string);
+    if (nameKey) brandIndex.set(nameKey, id);
+    if (slugKey && !brandIndex.has(slugKey)) brandIndex.set(slugKey, id);
+  }
+  for (const a of aliasRows as any[]) {
+    const aliasKey = normalizeBrandKey(a.alias as string);
+    if (aliasKey && !brandIndex.has(aliasKey)) {
+      brandIndex.set(aliasKey, a.brand_id as string);
+    }
+  }
+  console.log(`Sam's Club cron: brand index has ${brandIndex.size} keys`);
+
+  // 3) Mark all current Sam's Club state out of stock; the upsert loop will
+  //    flip back any brand we re-confirm.
+  const nowTs = new Date().toISOString();
+  await sql/* sql */ `
+    update provider_brand_discounts
+    set in_stock = false, fetched_at = ${nowTs}
+    where provider_id = ${providerId}
+  `;
+  await sql/* sql */ `
+    update provider_brand_products
+    set is_active = false, last_checked_at = ${nowTs}
+    where provider_id = ${providerId}
+  `;
+
+  // 4) Fetch all pages, accumulate the highest-discount offer per brand.
+  const accessToken = await fetchSamsClubAccessToken(env);
+
+  type BestOffer = {
+    brandId: string;
+    sku: string;
+    productName: string;
+    productUrl: string;
+    discount: number;
+  };
+  const bestPerBrand = new Map<string, BestOffer>();
+
+  let totalProducts = 0;
+  let matchedProducts = 0;
+  let droppedNoBrand = 0;
+  let droppedNoDiscount = 0;
+  let pageNumber = 1;
+  let totalPages = 1;
+
+  while (pageNumber <= totalPages && pageNumber <= SAMS_CLUB_MAX_PAGES) {
+    const { products, totalPages: tp } = await fetchSamsClubProductsPage(
+      accessToken,
+      pageNumber
+    );
+    if (pageNumber === 1) totalPages = tp;
+    totalProducts += products.length;
+
+    for (const p of products) {
+      // Pick current selling price. Sam's Club mostly populates <price>; when
+      // both are present, <saleprice> is sometimes inflated, so take the lower.
+      const currentPrice =
+        p.saleprice > 0 && p.saleprice < p.price ? p.saleprice : p.price;
+      if (currentPrice <= 0) {
+        droppedNoDiscount++;
+        continue;
+      }
+
+      const faceValue = extractSamsClubFaceValue(p.productName);
+      if (!faceValue || currentPrice >= faceValue) {
+        droppedNoDiscount++;
+        continue;
+      }
+
+      const discount = ((faceValue - currentPrice) / faceValue) * 100;
+      if (discount <= 0) {
+        droppedNoDiscount++;
+        continue;
+      }
+
+      const brandText = extractSamsClubBrandText(p.productName);
+      const brandKey = normalizeBrandKey(brandText);
+      const brandId = brandKey ? brandIndex.get(brandKey) : null;
+      if (!brandId) {
+        droppedNoBrand++;
+        continue;
+      }
+
+      matchedProducts++;
+      const existing = bestPerBrand.get(brandId);
+      if (!existing || discount > existing.discount) {
+        bestPerBrand.set(brandId, {
+          brandId,
+          sku: p.sku,
+          productName: p.productName,
+          productUrl: p.productUrl,
+          discount: Math.round(discount * 100) / 100,
+        });
+      }
+    }
+
+    pageNumber++;
+  }
+
+  console.log(
+    `Sam's Club cron: scanned ${totalProducts} products across ${pageNumber - 1} pages; ` +
+      `matched ${matchedProducts}, brands chosen ${bestPerBrand.size}, ` +
+      `dropped ${droppedNoBrand} unmatched, ${droppedNoDiscount} no-discount`
+  );
+
+  // 5) Persist the chosen offers. One product per brand for samsclub: replace
+  //    any older SKU rows for the same brand with the current best.
+  let upserted = 0;
+  for (const offer of bestPerBrand.values()) {
+    // Drop any stale Sam's Club products for this brand first (different SKUs)
+    await sql/* sql */ `
+      delete from provider_brand_products
+      where provider_id = ${providerId}
+        and brand_id = ${offer.brandId}
+        and (variant <> 'online' or coalesce(product_external_id, '') <> ${offer.sku})
+    `;
+
+    await sql/* sql */ `
+      insert into provider_brand_products
+        (provider_id, brand_id, variant, product_external_id, product_url,
+         is_active, last_seen_at, last_checked_at, discount_percent)
+      values
+        (${providerId}, ${offer.brandId}, 'online', ${offer.sku}, ${offer.productUrl},
+         true, ${nowTs}, ${nowTs}, ${offer.discount})
+      on conflict do nothing
+    `;
+    await sql/* sql */ `
+      update provider_brand_products
+      set product_url = ${offer.productUrl},
+          is_active = true,
+          last_seen_at = ${nowTs},
+          last_checked_at = ${nowTs},
+          discount_percent = ${offer.discount}
+      where provider_id = ${providerId}
+        and brand_id = ${offer.brandId}
+        and variant = 'online'
+        and coalesce(product_external_id, '') = ${offer.sku}
+    `;
+
+    await sql/* sql */ `
+      insert into provider_brand_discounts
+        (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+      values
+        (${providerId}, ${offer.brandId}, ${offer.discount}, true, ${nowTs})
+      on conflict (provider_id, brand_id)
+      do update set
+        max_discount_percent = excluded.max_discount_percent,
+        in_stock = true,
+        fetched_at = ${nowTs}
+    `;
+    upserted++;
+  }
+
+  // 6) Append history snapshot only for brands whose state changed
+  await sql/* sql */ `
+    insert into provider_brand_discount_history (
+      provider_id, brand_id, max_discount_percent, in_stock, observed_at
+    )
+    select pbd.provider_id, pbd.brand_id, pbd.max_discount_percent, pbd.in_stock, pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select max_discount_percent, in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
+  `;
+
+  console.log(`Sam's Club cron: upserted ${upserted} brand offers.`);
 }
