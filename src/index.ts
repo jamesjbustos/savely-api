@@ -136,69 +136,6 @@ function variantToLabel(variant: string | null | undefined): string | null {
   return null; // "other" → no label
 }
 
-function normalizeSamsClubMatchText(input: string): string {
-  let text = input;
-  for (let i = 0; i < 2; i += 1) {
-    try {
-      const decoded = decodeURIComponent(text);
-      if (decoded === text) break;
-      text = decoded;
-    } catch {
-      break;
-    }
-  }
-
-  return text
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/['’]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/-s(?=-|$)/g, "s")
-    .replace(/^-+|-+$/g, "")
-    .replace(/--+/g, "-");
-}
-
-function extractSamsClubProductKey(productUrl: string | null): string {
-  if (!productUrl) return "";
-
-  let rawUrl = productUrl;
-  try {
-    const affiliateUrl = new URL(productUrl);
-    rawUrl = affiliateUrl.searchParams.get("murl") || productUrl;
-  } catch {
-    rawUrl = productUrl;
-  }
-
-  try {
-    const samsUrl = new URL(rawUrl);
-    const productPath = samsUrl.pathname.match(/\/ip\/([^/?#]+)/i)?.[1];
-    return normalizeSamsClubMatchText(productPath || samsUrl.pathname);
-  } catch {
-    return normalizeSamsClubMatchText(rawUrl);
-  }
-}
-
-function isSamsClubOfferForBrand(
-  providerSlug: string,
-  productUrl: string | null,
-  brandName: string,
-  brandSlug: string
-): boolean {
-  if (providerSlug !== "samsclub") return true;
-
-  const productKey = extractSamsClubProductKey(productUrl);
-  if (!productKey) return true;
-
-  const candidates = [
-    normalizeSamsClubMatchText(brandName),
-    normalizeSamsClubMatchText(brandSlug),
-  ].filter((candidate) => candidate.length >= 3);
-
-  return candidates.some((candidate) =>
-    `-${productKey}-`.includes(`-${candidate}-`)
-  );
-}
-
 app.get("/health", (c) => c.text("ok"));
 
 // GET /brands
@@ -446,23 +383,7 @@ app.get("/brands/:slug", async (c) => {
     variant: string | null;
   };
 
-  type Offer = {
-    provider_id: string;
-    provider_name: string;
-    provider_slug: string;
-    discount_percent: number | null;
-    in_stock: boolean;
-    product_url: string | null;
-    variant: string | null;
-    variant_label: string | null;
-  };
-
-  function isBetterOffer(next: Offer, current: Offer): boolean {
-    if (next.in_stock !== current.in_stock) return next.in_stock;
-    return (next.discount_percent ?? 0) > (current.discount_percent ?? 0);
-  }
-
-  const offersAll = (offerRows as any as OfferRow[]).map((r): Offer => {
+  const offersAll = (offerRows as any as OfferRow[]).map((r) => {
     const rawDiscount = r.max_discount_percent;
     const discount =
       rawDiscount == null
@@ -484,33 +405,7 @@ app.get("/brands/:slug", async (c) => {
     };
   });
 
-  const brandName = brandRow.name as string;
-  const brandSlug = brandRow.slug as string;
-  const samsClubSafeOffers = offersAll.filter((offer) =>
-    isSamsClubOfferForBrand(
-      offer.provider_slug,
-      offer.product_url,
-      brandName,
-      brandSlug
-    )
-  );
-
-  const bestSamsClubOfferByProvider = new Map<string, Offer>();
-  const offersWithSamsClubDeduped: Offer[] = [];
-  for (const offer of samsClubSafeOffers) {
-    if (offer.provider_slug !== "samsclub") {
-      offersWithSamsClubDeduped.push(offer);
-      continue;
-    }
-
-    const current = bestSamsClubOfferByProvider.get(offer.provider_id);
-    if (!current || isBetterOffer(offer, current)) {
-      bestSamsClubOfferByProvider.set(offer.provider_id, offer);
-    }
-  }
-  offersWithSamsClubDeduped.push(...bestSamsClubOfferByProvider.values());
-
-  const clickableOffers = offersWithSamsClubDeduped.filter(
+  const clickableOffers = offersAll.filter(
     (o) =>
       o.in_stock &&
       o.discount_percent != null &&
