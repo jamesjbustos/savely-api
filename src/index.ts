@@ -246,9 +246,20 @@ app.get("/brands", async (c) => {
   const pageSizeRaw = Number.parseInt(pageSizeParam, 10);
 
   const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
+  // Cap raised to 1000 so the sitemap can fetch in 1-2 calls instead of 14+.
   const pageSize = Number.isFinite(pageSizeRaw)
-    ? Math.min(Math.max(pageSizeRaw, 1), 100)
+    ? Math.min(Math.max(pageSizeRaw, 1), 1000)
     : 24;
+  const offset = (page - 1) * pageSize;
+
+  const orderBy =
+    sortParam === "newest"
+      ? sql`order by coalesce(last_deal_updated, brand_created_at) desc nulls last, brand_name asc`
+      : sortParam === "discount_desc" || sortParam === "relevance"
+      ? sql`order by best_discount desc nulls last, brand_name asc`
+      : sortParam === "discount_asc"
+      ? sql`order by best_discount asc nulls last, brand_name asc`
+      : sql`order by brand_name asc`;
 
   const rows = await sql/* sql */ `
     with latest_deal_change as (
@@ -257,55 +268,61 @@ app.get("/brands", async (c) => {
         max(observed_at) as last_deal_updated
       from provider_brand_discount_history
       group by brand_id
+    ),
+    filtered as (
+      select
+        v.brand_id,
+        v.brand_name,
+        v.brand_slug,
+        v.base_domain,
+        b.description as brand_description,
+        b.created_at as brand_created_at,
+        ldc.last_deal_updated,
+        max(v.max_discount_percent) as best_discount,
+        bool_or(v.in_stock) as in_stock,
+        c.id as category_id,
+        c.name as category_name,
+        c.slug as category_slug
+      from v_brand_provider_offers v
+      join brands b on b.id = v.brand_id
+      left join latest_deal_change ldc on ldc.brand_id = v.brand_id
+      left join categories c on c.id = b.category_id
+      where b.status = 'active'
+        and v.max_discount_percent is not null
+        and v.in_stock = true
+        and v.product_url is not null
+        and (
+          ${hasSearch} = false
+          or lower(b.name) like lower(${searchPattern})
+          or lower(b.slug) like lower(${searchPattern})
+        )
+        and (
+          ${hasStartsWith} = false
+          or lower(b.name) like lower(${startsWithPattern})
+        )
+        and (
+          ${hasCategory} = false
+          or c.slug = ${categorySlug}
+        )
+      group by
+        v.brand_id,
+        v.brand_name,
+        v.brand_slug,
+        v.base_domain,
+        b.description,
+        b.created_at,
+        ldc.last_deal_updated,
+        c.id,
+        c.name,
+        c.slug
+      having
+        (${useMinDiscount} = false or max(v.max_discount_percent) >= ${minDiscount})
+        and (${useMaxDiscount} = false or max(v.max_discount_percent) <= ${maxDiscount})
     )
-    select
-      v.brand_id,
-      v.brand_name,
-      v.brand_slug,
-      v.base_domain,
-      b.description as brand_description,
-      b.created_at as brand_created_at,
-      ldc.last_deal_updated,
-      max(v.max_discount_percent) as best_discount,
-      bool_or(v.in_stock) as in_stock,
-      c.id as category_id,
-      c.name as category_name,
-      c.slug as category_slug
-    from v_brand_provider_offers v
-    join brands b on b.id = v.brand_id
-    left join latest_deal_change ldc on ldc.brand_id = v.brand_id
-    left join categories c on c.id = b.category_id
-    where b.status = 'active'
-      and v.max_discount_percent is not null
-      and v.in_stock = true
-      and v.product_url is not null
-      and (
-        ${hasSearch} = false
-        or lower(b.name) like lower(${searchPattern})
-        or lower(b.slug) like lower(${searchPattern})
-      )
-      and (
-        ${hasStartsWith} = false
-        or lower(b.name) like lower(${startsWithPattern})
-      )
-      and (
-        ${hasCategory} = false
-        or c.slug = ${categorySlug}
-      )
-    group by
-      v.brand_id,
-      v.brand_name,
-      v.brand_slug,
-      v.base_domain,
-      b.description,
-      b.created_at,
-      ldc.last_deal_updated,
-      c.id,
-      c.name,
-      c.slug
-    having
-      (${useMinDiscount} = false or max(v.max_discount_percent) >= ${minDiscount})
-      and (${useMaxDiscount} = false or max(v.max_discount_percent) <= ${maxDiscount})
+    select *, count(*) over () as total_count
+    from filtered
+    ${orderBy}
+    limit ${pageSize} offset ${offset}
   `;
 
   type Row = {
@@ -321,9 +338,15 @@ app.get("/brands", async (c) => {
     category_id: string | null;
     category_name: string | null;
     category_slug: string | null;
+    total_count: number | string;
   };
 
-  let brands = (rows as any as Row[]).map((r) => {
+  const total =
+    rows.length > 0
+      ? Number((rows[0] as any).total_count) || 0
+      : 0;
+
+  const brands = (rows as any as Row[]).map((r) => {
     const bestDiscount =
       r.best_discount == null
         ? null
@@ -343,7 +366,7 @@ app.get("/brands", async (c) => {
       id: r.brand_id,
       name: r.brand_name,
       slug: r.brand_slug,
-      base_domain: (r.base_domain as string | null) ?? null,
+      base_domain: r.base_domain ?? null,
       description: r.brand_description ?? null,
       created_at: r.brand_created_at ?? null,
       last_deal_updated: r.last_deal_updated ?? null,
@@ -353,56 +376,14 @@ app.get("/brands", async (c) => {
     };
   });
 
-  if (sortParam === "newest") {
-    // Sort by last_deal_updated descending (recently changed deals first)
-    brands.sort((a, b) => {
-      const aRaw = a.last_deal_updated || a.created_at;
-      const bRaw = b.last_deal_updated || b.created_at;
-      const aDate = String(aRaw || "");
-      const bDate = String(bRaw || "");
-      if (bDate !== aDate) return bDate.localeCompare(aDate);
-      return a.name.localeCompare(b.name);
-    });
-  } else if (sortParam === "discount_desc") {
-    brands.sort((a, b) => {
-      const ad = a.max_discount_percent ?? 0;
-      const bd = b.max_discount_percent ?? 0;
-      if (bd !== ad) return bd - ad;
-      return a.name.localeCompare(b.name);
-    });
-  } else if (sortParam === "discount_asc") {
-    brands.sort((a, b) => {
-      const ad = a.max_discount_percent ?? 0;
-      const bd = b.max_discount_percent ?? 0;
-      if (ad !== bd) return ad - bd;
-      return a.name.localeCompare(b.name);
-    });
-  } else if (sortParam === "relevance") {
-    // Without view counts, relevance falls back to best discount
-    brands.sort((a, b) => {
-      const ad = a.max_discount_percent ?? 0;
-      const bd = b.max_discount_percent ?? 0;
-      if (bd !== ad) return bd - ad;
-      return a.name.localeCompare(b.name);
-    });
-  } else {
-    // default A–Z
-    brands.sort((a, b) => a.name.localeCompare(b.name));
-  }
-
-  const total = brands.length;
-  const start = (page - 1) * pageSize;
-  const paginated =
-    start >= 0 && start < total ? brands.slice(start, start + pageSize) : [];
-
   const response = c.json({
     page,
     page_size: pageSize,
     total,
-    brands: paginated,
+    brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 1800, 7200);
 });
 
 // GET /brands/:slug
@@ -784,7 +765,7 @@ app.get("/categories/:slug", async (c) => {
     brands,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 1800, 7200);
 });
 
 // GET /popular-brands?limit=20
@@ -1638,20 +1619,24 @@ app.get("/brands/:slug/discount-history", async (c) => {
 
   const brandId = (brandRows[0] as any).id;
 
-  // Get discount history with provider info
+  // Get discount history with provider info, aggregated per day.
+  // Charts render at day-level granularity, so collapsing 15-min snapshots
+  // into daily max(discount) cuts payload ~96x without changing what the
+  // user sees.
   const historyRows = await sql/* sql */ `
     select
       h.provider_id,
       p.name as provider_name,
       p.slug as provider_slug,
-      h.max_discount_percent,
-      h.in_stock,
-      h.observed_at
+      max(h.max_discount_percent) as max_discount_percent,
+      bool_or(h.in_stock) as in_stock,
+      date_trunc('day', h.observed_at)::date as observed_at
     from provider_brand_discount_history h
     join providers p on p.id = h.provider_id
     where h.brand_id = ${brandId}
       and h.observed_at >= now() - (${days} * interval '1 day')
-    order by h.observed_at asc
+    group by h.provider_id, p.name, p.slug, date_trunc('day', h.observed_at)::date
+    order by date_trunc('day', h.observed_at)::date asc
   `;
 
   type HistoryRow = {
@@ -1782,7 +1767,7 @@ app.get("/brands/:slug/discount-history", async (c) => {
     providers,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 3600, 7200);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 21600, 43200);
 });
 
 // Scheduled handler: compute popular brands from Axiom → KV.
