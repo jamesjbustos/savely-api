@@ -1859,6 +1859,125 @@ app.post("/internal/compute-popular-brands", async (c) => {
   return c.json({ ok: true });
 });
 
+// ── Admin: brand approval ────────────────────────────────────
+// Server-to-server only (called by the www-savely /admin), protected by
+// Bearer CRON_SECRET. Implements the brand-onboarding review process:
+// pending brands -> pick correct base_domain (from candidates) + category -> activate.
+app.use("/admin/*", async (c, next) => {
+  const authHeader = c.req.header("authorization") || "";
+  if (!c.env.CRON_SECRET || authHeader !== `Bearer ${c.env.CRON_SECRET}`) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+});
+
+// Categories (for the approval dropdown).
+app.get("/admin/categories", async (c) => {
+  const sql = getDb(c.env);
+  const categories = await sql`select id, name, slug from categories order by name`;
+  return c.json({ categories });
+});
+
+// Pending-brands review queue: each brand + its scored domain candidates + current review + category.
+app.get("/admin/pending-brands", async (c) => {
+  const sql = getDb(c.env);
+  const page = Math.max(1, Number.parseInt(c.req.query("page") || "1", 10) || 1);
+  const perPage = 25;
+  const offset = (page - 1) * perPage;
+
+  const totalRow = await sql`select count(*)::int as n from brands where status = 'pending'`;
+  const total = (totalRow[0]?.n as number) ?? 0;
+
+  const brands = await sql`
+    select b.id, b.name, b.slug, b.base_domain, b.status, b.category_id,
+           c.name as category_name, b.created_at
+    from brands b
+    left join categories c on c.id = b.category_id
+    where b.status = 'pending'
+    order by b.created_at desc
+    limit ${perPage} offset ${offset}`;
+
+  if (brands.length === 0) {
+    return c.json({ page, per_page: perPage, total, brands: [] });
+  }
+
+  const ids = brands.map((b) => b.id as string);
+  const candidates = await sql`
+    select brand_id, candidate_domain, score, google_rank, title, is_filtered
+    from brand_domain_candidates
+    where brand_id = any(${ids}::uuid[]) and coalesce(is_filtered, false) = false
+    order by score desc nulls last`;
+  const reviews = await sql`
+    select brand_id, chosen_domain, score, status, reviewer_notes, reviewed_at
+    from brand_domain_reviews
+    where brand_id = any(${ids}::uuid[])`;
+
+  const candByBrand: Record<string, unknown[]> = {};
+  for (const r of candidates) (candByBrand[r.brand_id as string] ??= []).push(r);
+  const reviewByBrand: Record<string, unknown> = {};
+  for (const r of reviews) reviewByBrand[r.brand_id as string] = r;
+
+  return c.json({
+    page,
+    per_page: perPage,
+    total,
+    brands: brands.map((b) => ({
+      ...b,
+      candidates: candByBrand[b.id as string] ?? [],
+      review: reviewByBrand[b.id as string] ?? null,
+    })),
+  });
+});
+
+// Update / approve a brand. Guard: cannot activate without base_domain + category.
+app.patch("/admin/brands/:id", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  let body: Record<string, unknown>;
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: "Invalid JSON" }, 400);
+  }
+
+  const existing = await sql`select base_domain, status, category_id from brands where id = ${id}`;
+  if (existing.length === 0) return c.json({ error: "Brand not found" }, 404);
+  const curRow = existing[0]!;
+
+  const desiredStatus = (body.status ?? curRow.status) as string;
+  const desiredBase = body.base_domain !== undefined ? body.base_domain : curRow.base_domain;
+  const desiredCategory =
+    body.category_id !== undefined ? body.category_id : curRow.category_id;
+
+  if (desiredStatus !== "pending" && desiredStatus !== "active") {
+    return c.json({ error: "Invalid status" }, 400);
+  }
+  if (
+    desiredStatus === "active" &&
+    (!desiredBase || !String(desiredBase).trim() || !desiredCategory)
+  ) {
+    return c.json(
+      { error: "base_domain and category are required before activating a brand" },
+      400,
+    );
+  }
+
+  const update: Record<string, unknown> = {};
+  if (body.name !== undefined) update.name = body.name;
+  if (body.slug !== undefined) update.slug = body.slug;
+  if (body.base_domain !== undefined) update.base_domain = body.base_domain || null;
+  if (body.category_id !== undefined) update.category_id = body.category_id || null;
+  if (body.status !== undefined) update.status = desiredStatus;
+  if (Object.keys(update).length === 0) {
+    return c.json({ error: "No fields to update" }, 400);
+  }
+
+  await sql`update brands set ${sql(update)}, updated_at = now() where id = ${id}`;
+  const updated = await sql`
+    select id, name, slug, base_domain, status, category_id from brands where id = ${id}`;
+  return c.json({ brand: updated[0] });
+});
+
 export default {
   fetch(
     request: Request,
