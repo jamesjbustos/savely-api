@@ -1859,6 +1859,39 @@ app.post("/internal/compute-popular-brands", async (c) => {
   return c.json({ ok: true });
 });
 
+// GET /search-index
+// All ACTIVE brands (including ones with no current offer) for the website's
+// fast client-side search. LEFT JOIN so a freshly-activated brand shows up even
+// before any discount lands. Short cache so new brands appear within ~1 min.
+app.get("/search-index", async (c) => {
+  const { cache, cacheKey, cached } = await getCached(c.req.url);
+  if (cached) return cached;
+
+  const sql = getDb(c.env);
+  const rows = await sql`
+    select b.id, b.name, b.slug, b.base_domain,
+           max(v.max_discount_percent) as max_discount_percent
+    from brands b
+    left join v_brand_provider_offers v
+      on v.brand_id = b.id and v.in_stock = true and v.product_url is not null
+    where b.status = 'active'
+    group by b.id, b.name, b.slug, b.base_domain
+    order by b.name
+  `;
+
+  const brands = rows.map((r) => ({
+    id: r.id as string,
+    name: r.name as string,
+    slug: r.slug as string,
+    base_domain: (r.base_domain as string) ?? "",
+    max_discount_percent:
+      r.max_discount_percent == null ? null : Number(r.max_discount_percent),
+  }));
+
+  const response = c.json({ brands, total: brands.length });
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 60, 300);
+});
+
 // ── Admin: brand approval ────────────────────────────────────
 // Server-to-server only (called by the www-savely /admin), protected by
 // Bearer CRON_SECRET. Implements the brand-onboarding review process:
