@@ -2025,6 +2025,474 @@ app.patch("/admin/brands/:id", async (c) => {
   return c.json({ brand: updated[0] });
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Admin: brand-operations dashboard (matching queue, brand CRUD, domains,
+// merge, reports, audit). All under /admin/* → auto-protected by the Bearer
+// CRON_SECRET middleware above. The web admin passes the acting admin's email
+// in `x-admin-actor` for the audit trail.
+// ───────────────────────────────────────────────────────────────────────────
+
+async function recordAudit(
+  sql: ReturnType<typeof getDb>,
+  c: any,
+  action: string,
+  entityType: string | null,
+  entityId: string | null,
+  details: unknown,
+) {
+  const actor = c.req.header("x-admin-actor") || null;
+  try {
+    await sql/* sql */ `
+      insert into admin_audit_log (actor_email, action, entity_type, entity_id, details)
+      values (${actor}, ${action}, ${entityType}, ${entityId}, ${
+        details === undefined || details === null ? null : sql.json(details as any)
+      })`;
+  } catch (e) {
+    console.error("audit log insert failed", e);
+  }
+}
+
+function adminPage(c: any) {
+  return Math.max(1, Number.parseInt(c.req.query("page") || "1", 10) || 1);
+}
+
+// ── Matching queue (keystone) ────────────────────────────────────
+app.get("/admin/unmatched-products", async (c) => {
+  const sql = getDb(c.env);
+  const q = (c.req.query("q") || "").trim();
+  const providerSlug = (c.req.query("provider") || "").trim();
+  const page = adminPage(c);
+  const perPage = 50;
+  const offset = (page - 1) * perPage;
+  const like = `%${q}%`;
+  const rows = await sql/* sql */ `
+    select u.id, u.provider_id, p.slug as provider_slug, p.name as provider_name,
+           u.product_external_id, u.product_name, u.product_url, u.normalized_key,
+           u.last_seen_at, count(*) over() as total_count
+    from provider_unmatched_products u
+    join providers p on p.id = u.provider_id
+    where u.dismissed = false
+      and (${providerSlug} = '' or p.slug = ${providerSlug})
+      and (${q} = '' or u.product_name ilike ${like} or u.normalized_key ilike ${like})
+    order by u.last_seen_at desc
+    limit ${perPage} offset ${offset}`;
+  const total = rows[0] ? Number(rows[0].total_count) : 0;
+  return c.json({
+    page,
+    per_page: perPage,
+    total,
+    products: rows.map(({ total_count, ...r }: any) => r),
+  });
+});
+
+app.post("/admin/unmatched-products/match", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => null)) as any;
+  if (!body?.id || !body?.brand_id) {
+    return c.json({ error: "id and brand_id are required" }, 400);
+  }
+  const rows = await sql`select * from provider_unmatched_products where id = ${body.id}`;
+  if (!rows.length) return c.json({ error: "Unmatched product not found" }, 404);
+  const u = rows[0]!;
+  const alias = String(body.alias || u.normalized_key || "").trim();
+  if (!alias) return c.json({ error: "No alias key to save" }, 400);
+  // Persist the mapping so future cron runs attach this brand automatically.
+  await sql`insert into brand_aliases (brand_id, alias) values (${body.brand_id}, ${alias})
+            on conflict do nothing`;
+  await sql`delete from provider_unmatched_products where id = ${body.id}`;
+  await recordAudit(sql, c, "match_unmatched_product", "brand", String(body.brand_id), {
+    alias,
+    product_name: u.product_name,
+    provider_id: u.provider_id,
+  });
+  return c.json({ ok: true, alias });
+});
+
+app.post("/admin/unmatched-products/dismiss", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => null)) as any;
+  if (!body?.id) return c.json({ error: "id is required" }, 400);
+  await sql`update provider_unmatched_products set dismissed = true where id = ${body.id}`;
+  await recordAudit(sql, c, "dismiss_unmatched_product", "unmatched_product", String(body.id), null);
+  return c.json({ ok: true });
+});
+
+// ── Dashboard stats ──────────────────────────────────────────────
+app.get("/admin/dashboard-stats", async (c) => {
+  const sql = getDb(c.env);
+  const [brandCounts, missingDomain, aliasCount, redeemableCount, liveOffers, unmatchedCount] =
+    await Promise.all([
+      sql`select status, count(*)::int as n from brands group by status`,
+      sql`select count(*)::int as n from brands where status='active' and base_domain is null`,
+      sql`select count(*)::int as n from brand_aliases`,
+      sql`select count(*)::int as n from brand_redeemable_domains`,
+      sql`select count(*)::int as n from v_brand_provider_offers where in_stock = true and max_discount_percent > 0`,
+      sql`select count(*)::int as n from provider_unmatched_products where dismissed = false`,
+    ]);
+  const byStatus: Record<string, number> = {};
+  for (const r of brandCounts as any[]) byStatus[r.status as string] = r.n as number;
+  return c.json({
+    brands_total: Object.values(byStatus).reduce((a, b) => a + b, 0),
+    brands_active: byStatus.active ?? 0,
+    brands_pending: byStatus.pending ?? 0,
+    missing_domain: (missingDomain[0] as any)?.n ?? 0,
+    aliases: (aliasCount[0] as any)?.n ?? 0,
+    redeemable_domains: (redeemableCount[0] as any)?.n ?? 0,
+    live_offers: (liveOffers[0] as any)?.n ?? 0,
+    unmatched_products: (unmatchedCount[0] as any)?.n ?? 0,
+  });
+});
+
+// ── Audit log ────────────────────────────────────────────────────
+app.get("/admin/audit-log", async (c) => {
+  const sql = getDb(c.env);
+  const page = adminPage(c);
+  const perPage = 50;
+  const offset = (page - 1) * perPage;
+  const rows = await sql/* sql */ `
+    select id, actor_email, action, entity_type, entity_id, details, created_at,
+           count(*) over() as total_count
+    from admin_audit_log
+    order by created_at desc
+    limit ${perPage} offset ${offset}`;
+  const total = rows[0] ? Number(rows[0].total_count) : 0;
+  return c.json({ page, per_page: perPage, total, entries: rows.map(({ total_count, ...r }: any) => r) });
+});
+
+app.post("/admin/audit-log/clear", async (c) => {
+  const sql = getDb(c.env);
+  await sql`delete from admin_audit_log`;
+  return c.json({ ok: true });
+});
+
+// ── Brand search (MUST be before /admin/brands/:id) ──────────────
+app.get("/admin/brands/search", async (c) => {
+  const sql = getDb(c.env);
+  const q = (c.req.query("q") || "").trim();
+  if (!q) return c.json({ brands: [] });
+  const like = `%${q}%`;
+  const rows = await sql/* sql */ `
+    select id, name, slug, base_domain, status
+    from brands
+    where name ilike ${like} or slug ilike ${like} or base_domain ilike ${like}
+    order by (name ilike ${q + "%"}) desc, name asc
+    limit 20`;
+  return c.json({ brands: rows });
+});
+
+// ── Reports ──────────────────────────────────────────────────────
+app.get("/admin/reports/max-discount", async (c) => {
+  const sql = getDb(c.env);
+  const rows = await sql/* sql */ `
+    select distinct on (v.brand_id)
+      v.brand_id, v.brand_name, v.brand_slug, v.provider_name, v.provider_slug,
+      v.max_discount_percent, v.product_url
+    from v_brand_provider_offers v
+    where v.in_stock = true and v.max_discount_percent > 0
+    order by v.brand_id, v.max_discount_percent desc
+    limit 50`;
+  rows.sort(
+    (a: any, b: any) => Number(b.max_discount_percent) - Number(a.max_discount_percent),
+  );
+  return c.json({ rows });
+});
+
+app.get("/admin/reports/sold-out", async (c) => {
+  const sql = getDb(c.env);
+  const windowDays = Math.min(
+    90,
+    Math.max(1, Number.parseInt(c.req.query("window_days") || "7", 10) || 7),
+  );
+  // Brands whose latest history row is out-of-stock but had an in-stock row in window.
+  const rows = await sql/* sql */ `
+    with latest as (
+      select distinct on (provider_id, brand_id)
+        provider_id, brand_id, in_stock, max_discount_percent, observed_at
+      from provider_brand_discount_history
+      where observed_at >= now() - (${windowDays} * interval '1 day')
+      order by provider_id, brand_id, observed_at desc
+    ),
+    last_instock as (
+      select distinct on (provider_id, brand_id)
+        provider_id, brand_id, max_discount_percent as last_discount, observed_at as last_in_stock_at
+      from provider_brand_discount_history
+      where in_stock = true and observed_at >= now() - (${windowDays} * interval '1 day')
+      order by provider_id, brand_id, observed_at desc
+    )
+    select b.name as brand_name, b.slug as brand_slug, p.name as provider_name,
+           li.last_discount, li.last_in_stock_at, l.observed_at as sold_out_at
+    from latest l
+    join last_instock li on li.provider_id = l.provider_id and li.brand_id = l.brand_id
+    join brands b on b.id = l.brand_id
+    join providers p on p.id = l.provider_id
+    where l.in_stock = false
+    order by l.observed_at desc
+    limit 100`;
+  return c.json({ window_days: windowDays, rows });
+});
+
+// ── Pending domain reviews + alias candidates ────────────────────
+app.get("/admin/pending-domain-reviews", async (c) => {
+  const sql = getDb(c.env);
+  const page = adminPage(c);
+  const perPage = 50;
+  const offset = (page - 1) * perPage;
+  const brands = await sql/* sql */ `
+    select b.id, b.name, b.slug, b.created_at, count(*) over() as total_count
+    from brands b
+    where b.base_domain is null
+    order by b.created_at desc
+    limit ${perPage} offset ${offset}`;
+  const total = brands[0] ? Number(brands[0].total_count) : 0;
+  const ids = brands.map((b: any) => b.id);
+  let candByBrand: Record<string, unknown[]> = {};
+  let reviewByBrand: Record<string, unknown> = {};
+  if (ids.length) {
+    const candidates = await sql`
+      select brand_id, candidate_domain, score, google_rank, title
+      from brand_domain_candidates
+      where brand_id = any(${ids}::uuid[]) and coalesce(is_filtered,false)=false
+      order by score desc nulls last`;
+    const reviews = await sql`
+      select brand_id, chosen_domain, status, reviewed_at
+      from brand_domain_reviews where brand_id = any(${ids}::uuid[])`;
+    for (const r of candidates as any[]) (candByBrand[r.brand_id] ??= []).push(r);
+    for (const r of reviews as any[]) reviewByBrand[r.brand_id] = r;
+  }
+  return c.json({
+    page,
+    per_page: perPage,
+    total,
+    brands: brands.map((b: any) => ({
+      ...b,
+      total_count: undefined,
+      candidates: candByBrand[b.id] ?? [],
+      review: reviewByBrand[b.id] ?? null,
+    })),
+  });
+});
+
+app.post("/admin/domain-reviews/decision", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => null)) as any;
+  if (!body?.brand_id || !body?.decision) {
+    return c.json({ error: "brand_id and decision required" }, 400);
+  }
+  if (body.decision === "approve") {
+    const domain = String(body.domain || "").trim().toLowerCase();
+    if (!domain) return c.json({ error: "domain required to approve" }, 400);
+    await sql`update brands set base_domain = ${domain}, updated_at = now() where id = ${body.brand_id}`;
+    await sql`
+      insert into brand_domain_reviews (brand_id, chosen_domain, status, reviewed_at)
+      values (${body.brand_id}, ${domain}, 'accepted', now())
+      on conflict (brand_id) do update set chosen_domain = excluded.chosen_domain,
+        status = 'accepted', reviewed_at = now()`;
+    await recordAudit(sql, c, "approve_domain", "brand", String(body.brand_id), { domain });
+  } else {
+    await sql`
+      insert into brand_domain_reviews (brand_id, status, reviewed_at)
+      values (${body.brand_id}, 'rejected', now())
+      on conflict (brand_id) do update set status='rejected', reviewed_at = now()`;
+    await recordAudit(sql, c, "reject_domain", "brand", String(body.brand_id), null);
+  }
+  return c.json({ ok: true });
+});
+
+app.get("/admin/alias-candidates", async (c) => {
+  const sql = getDb(c.env);
+  const rows = await sql/* sql */ `
+    select cand.brand_id, b.name as brand_name, b.slug as brand_slug, b.base_domain,
+           cand.candidate_domain, cand.score, cand.google_rank,
+           other.id as cross_brand_id, other.name as cross_brand_name
+    from brand_domain_candidates cand
+    join brands b on b.id = cand.brand_id
+    left join brands other on other.base_domain = cand.candidate_domain and other.id <> cand.brand_id
+    where coalesce(cand.is_filtered,false) = false
+      and cand.candidate_domain is not null
+      and (b.base_domain is null or cand.candidate_domain <> b.base_domain)
+    order by cand.score desc nulls last
+    limit 200`;
+  return c.json({ rows });
+});
+
+// ── Brand list / detail / CRUD ───────────────────────────────────
+app.get("/admin/brands", async (c) => {
+  const sql = getDb(c.env);
+  const q = (c.req.query("q") || "").trim();
+  const status = (c.req.query("status") || "").trim();
+  const page = adminPage(c);
+  const perPage = Math.min(100, Math.max(1, Number.parseInt(c.req.query("per_page") || "50", 10) || 50));
+  const offset = (page - 1) * perPage;
+  const like = `%${q}%`;
+  const rows = await sql/* sql */ `
+    select b.id, b.name, b.slug, b.base_domain, b.status, b.category_id, b.created_at,
+           count(*) over() as total_count
+    from brands b
+    where (${status} = '' or b.status = ${status})
+      and (${q} = '' or b.name ilike ${like} or b.slug ilike ${like} or b.base_domain ilike ${like})
+    order by b.name asc
+    limit ${perPage} offset ${offset}`;
+  const total = rows[0] ? Number(rows[0].total_count) : 0;
+  return c.json({ page, per_page: perPage, total, brands: rows.map(({ total_count, ...r }: any) => r) });
+});
+
+app.post("/admin/brands", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => null)) as any;
+  const name = String(body?.name || "").trim();
+  const slug = String(body?.slug || "").trim();
+  if (!name || !slug) return c.json({ error: "name and slug required" }, 400);
+  const rows = await sql`
+    insert into brands (name, slug, base_domain, status)
+    values (${name}, ${slug}, ${body.base_domain || null}, ${body.status || "pending"})
+    on conflict (slug) do nothing
+    returning id, name, slug, base_domain, status`;
+  if (!rows.length) return c.json({ error: "slug already exists" }, 409);
+  await recordAudit(sql, c, "create_brand", "brand", rows[0]!.id as string, { name, slug });
+  return c.json({ brand: rows[0] });
+});
+
+app.post("/admin/brands/create-dummy", async (c) => {
+  const sql = getDb(c.env);
+  const n = Math.floor(Math.random() * 1e9);
+  const slug = `dummy-brand-${n}`;
+  const rows = await sql`
+    insert into brands (name, slug, status) values (${"Dummy Brand " + n}, ${slug}, 'pending')
+    returning id, name, slug`;
+  await recordAudit(sql, c, "create_dummy_brand", "brand", rows[0]?.id as string, { slug });
+  return c.json({ brand: rows[0] });
+});
+
+app.post("/admin/brands/delete-dummy", async (c) => {
+  const sql = getDb(c.env);
+  const res = await sql`delete from brands where slug like 'dummy-brand-%' returning id`;
+  await recordAudit(sql, c, "delete_dummy_brands", "brand", null, { count: res.length });
+  return c.json({ ok: true, deleted: res.length });
+});
+
+app.post("/admin/brands/merge", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => null)) as any;
+  if (!body?.keep_id || !body?.discard_id) {
+    return c.json({ error: "keep_id and discard_id required" }, 400);
+  }
+  if (body.keep_id === body.discard_id) {
+    return c.json({ error: "keep and discard must differ" }, 400);
+  }
+  await sql`select merge_brands(${body.keep_id}::uuid, ${body.discard_id}::uuid)`;
+  await recordAudit(sql, c, "merge_brands", "brand", String(body.keep_id), {
+    discard_id: body.discard_id,
+  });
+  return c.json({ ok: true });
+});
+
+app.get("/admin/brands/:id", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  const brandRows = await sql`
+    select b.*, c.name as category_name
+    from brands b left join categories c on c.id = b.category_id where b.id = ${id}`;
+  if (!brandRows.length) return c.json({ error: "Brand not found" }, 404);
+  const [aliases, domains, redeemable, offers, candidates, review] = await Promise.all([
+    sql`select id, alias from brand_aliases where brand_id = ${id} order by alias`,
+    sql`select id, domain, is_primary from brand_domains where brand_id = ${id} order by is_primary desc, domain`,
+    sql`select id, domain from brand_redeemable_domains where brand_id = ${id} order by domain`,
+    sql`select provider_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
+        from v_brand_provider_offers where brand_id = ${id}
+        order by max_discount_percent desc nulls last`,
+    sql`select candidate_domain, score, google_rank, title, is_filtered
+        from brand_domain_candidates where brand_id = ${id} order by score desc nulls last`,
+    sql`select chosen_domain, score, status, reviewer_notes, reviewed_at
+        from brand_domain_reviews where brand_id = ${id}`,
+  ]);
+  return c.json({
+    brand: brandRows[0],
+    aliases,
+    domains,
+    redeemable,
+    offers,
+    candidates,
+    review: review[0] ?? null,
+  });
+});
+
+app.get("/admin/brands/:id/providers", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  const rows = await sql`
+    select provider_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
+    from v_brand_provider_offers where brand_id = ${id} order by max_discount_percent desc nulls last`;
+  return c.json({ offers: rows });
+});
+
+// Aliases / domains / redeemable CRUD (used by the brand-detail page).
+app.post("/admin/brands/:id/aliases", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => null)) as any;
+  const alias = String(body?.alias || "").trim();
+  if (!alias) return c.json({ error: "alias required" }, 400);
+  await sql`insert into brand_aliases (brand_id, alias) values (${id}, ${alias}) on conflict do nothing`;
+  await recordAudit(sql, c, "add_alias", "brand", id, { alias });
+  return c.json({ ok: true });
+});
+
+app.delete("/admin/brands/:id/aliases/:aliasId", async (c) => {
+  const sql = getDb(c.env);
+  await sql`delete from brand_aliases where id = ${c.req.param("aliasId")} and brand_id = ${c.req.param("id")}`;
+  await recordAudit(sql, c, "delete_alias", "brand", c.req.param("id"), { alias_id: c.req.param("aliasId") });
+  return c.json({ ok: true });
+});
+
+app.post("/admin/brands/:id/domains", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => null)) as any;
+  const domain = String(body?.domain || "").trim().toLowerCase();
+  if (!domain) return c.json({ error: "domain required" }, 400);
+  if (body.is_primary) {
+    await sql`update brand_domains set is_primary = false where brand_id = ${id}`;
+  }
+  await sql`insert into brand_domains (brand_id, domain, is_primary)
+            values (${id}, ${domain}, ${!!body.is_primary}) on conflict do nothing`;
+  await recordAudit(sql, c, "add_domain", "brand", id, { domain, is_primary: !!body.is_primary });
+  return c.json({ ok: true });
+});
+
+app.delete("/admin/brands/:id/domains/:domainId", async (c) => {
+  const sql = getDb(c.env);
+  await sql`delete from brand_domains where id = ${c.req.param("domainId")} and brand_id = ${c.req.param("id")}`;
+  await recordAudit(sql, c, "delete_domain", "brand", c.req.param("id"), { domain_id: c.req.param("domainId") });
+  return c.json({ ok: true });
+});
+
+app.post("/admin/brands/:id/domains/:domainId/primary", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  await sql`update brand_domains set is_primary = false where brand_id = ${id}`;
+  await sql`update brand_domains set is_primary = true where id = ${c.req.param("domainId")} and brand_id = ${id}`;
+  await recordAudit(sql, c, "set_primary_domain", "brand", id, { domain_id: c.req.param("domainId") });
+  return c.json({ ok: true });
+});
+
+app.post("/admin/brands/:id/redeemable", async (c) => {
+  const sql = getDb(c.env);
+  const id = c.req.param("id");
+  const body = (await c.req.json().catch(() => null)) as any;
+  const domain = String(body?.domain || "").trim().toLowerCase();
+  if (!domain) return c.json({ error: "domain required" }, 400);
+  await sql`insert into brand_redeemable_domains (brand_id, domain) values (${id}, ${domain}) on conflict do nothing`;
+  await recordAudit(sql, c, "add_redeemable", "brand", id, { domain });
+  return c.json({ ok: true });
+});
+
+app.delete("/admin/brands/:id/redeemable/:domainId", async (c) => {
+  const sql = getDb(c.env);
+  await sql`delete from brand_redeemable_domains where id = ${c.req.param("domainId")} and brand_id = ${c.req.param("id")}`;
+  await recordAudit(sql, c, "delete_redeemable", "brand", c.req.param("id"), { domain_id: c.req.param("domainId") });
+  return c.json({ ok: true });
+});
+
 export default {
   fetch(
     request: Request,

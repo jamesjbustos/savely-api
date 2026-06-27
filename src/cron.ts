@@ -1630,6 +1630,8 @@ function extractRetailBrandText(title: string): string {
 /** Normalize a name so "Applebee's", "applebees", and "Apple Bee's" collapse to one key. */
 function normalizeBrandKey(s: string): string {
   return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "") // strip diacritics: "Aéropostale" -> "aeropostale"
     .toLowerCase()
     .replace(/['']/g, "")
     .replace(/&/g, "and")
@@ -2028,7 +2030,10 @@ export async function runGiftcardsComCron(
 
   let totalProducts = 0;
   let matchedProducts = 0;
-  const unmatched: string[] = [];
+  // Unmatched products (deduped by sku) feed the admin matching queue.
+  type Unmatched = { sku: string; productName: string; productUrl: string; key: string };
+  const unmatched = new Map<string, Unmatched>();
+  const matchedSkus: string[] = [];
   let pageNumber = 1;
   let totalPages = 1;
 
@@ -2047,10 +2052,18 @@ export async function runGiftcardsComCron(
       const brandKey = normalizeBrandKey(extractRetailBrandText(p.productName));
       const brandId = resolveBrandId(brandKey);
       if (!brandId) {
-        unmatched.push(p.productName);
+        if (!unmatched.has(p.sku)) {
+          unmatched.set(p.sku, {
+            sku: p.sku,
+            productName: p.productName,
+            productUrl: p.productUrl,
+            key: brandKey,
+          });
+        }
         continue;
       }
 
+      matchedSkus.push(p.sku);
       matchedProducts++;
       const existing = bestPerBrand.get(brandId);
       // Prefer the most canonical product per brand: shorter title wins (e.g.
@@ -2071,7 +2084,7 @@ export async function runGiftcardsComCron(
   console.log(
     `Giftcards.com cron: scanned ${totalProducts} products across ${pageNumber - 1} pages; ` +
       `matched ${matchedProducts}, brands chosen ${bestPerBrand.size}, ` +
-      `dropped ${unmatched.length} unmatched`
+      `dropped ${unmatched.size} unmatched`
   );
 
   if (dryRun) {
@@ -2080,7 +2093,7 @@ export async function runGiftcardsComCron(
       console.log(`  ${brandIdToSlug.get(o.brandId)} <- "${o.productName}"`);
     }
     console.log("\n--- DRY RUN: unmatched product names ---");
-    for (const name of unmatched) console.log(`  ${name}`);
+    for (const u of unmatched.values()) console.log(`  ${u.productName}`);
     console.log("\nDRY RUN: no database writes performed.");
     return;
   }
@@ -2166,5 +2179,30 @@ export async function runGiftcardsComCron(
       )
   `;
 
-  console.log(`Giftcards.com cron: upserted ${upserted} brand offers.`);
+  // 7) Sync the unmatched-products queue (powers the admin matching UI).
+  //    Remove rows we now match (e.g. after an admin added an alias), then
+  //    upsert the still-unmatched ones (keep any 'dismissed' flag intact).
+  if (matchedSkus.length > 0) {
+    await sql/* sql */ `
+      delete from provider_unmatched_products
+      where provider_id = ${providerId} and product_external_id = any(${matchedSkus})
+    `;
+  }
+  for (const u of unmatched.values()) {
+    await sql/* sql */ `
+      insert into provider_unmatched_products
+        (provider_id, product_external_id, product_name, product_url, normalized_key, last_seen_at)
+      values
+        (${providerId}, ${u.sku}, ${u.productName}, ${u.productUrl}, ${u.key}, ${nowTs})
+      on conflict (provider_id, product_external_id) do update set
+        product_name = excluded.product_name,
+        product_url = excluded.product_url,
+        normalized_key = excluded.normalized_key,
+        last_seen_at = excluded.last_seen_at
+    `;
+  }
+
+  console.log(
+    `Giftcards.com cron: upserted ${upserted} brand offers, ${unmatched.size} unmatched queued.`
+  );
 }
