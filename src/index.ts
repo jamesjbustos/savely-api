@@ -2120,15 +2120,14 @@ app.post("/admin/unmatched-products/dismiss", async (c) => {
 // ── Dashboard stats ──────────────────────────────────────────────
 app.get("/admin/dashboard-stats", async (c) => {
   const sql = getDb(c.env);
-  const [brandCounts, missingDomain, aliasCount, redeemableCount, liveOffers, unmatchedCount] =
-    await Promise.all([
-      sql`select status, count(*)::int as n from brands group by status`,
-      sql`select count(*)::int as n from brands where status='active' and base_domain is null`,
-      sql`select count(*)::int as n from brand_aliases`,
-      sql`select count(*)::int as n from brand_redeemable_domains`,
-      sql`select count(*)::int as n from v_brand_provider_offers where in_stock = true and max_discount_percent > 0`,
-      sql`select count(*)::int as n from provider_unmatched_products where dismissed = false`,
-    ]);
+  // Run sequentially: concurrent queries on one connection over the Supabase
+  // transaction pooler can stall.
+  const brandCounts = await sql`select status, count(*)::int as n from brands group by status`;
+  const missingDomain = await sql`select count(*)::int as n from brands where status='active' and base_domain is null`;
+  const aliasCount = await sql`select count(*)::int as n from brand_aliases`;
+  const redeemableCount = await sql`select count(*)::int as n from brand_redeemable_domains`;
+  const liveOffers = await sql`select count(*)::int as n from v_brand_provider_offers where in_stock = true and max_discount_percent > 0`;
+  const unmatchedCount = await sql`select count(*)::int as n from provider_unmatched_products where dismissed = false`;
   const byStatus: Record<string, number> = {};
   for (const r of brandCounts as any[]) byStatus[r.status as string] = r.n as number;
   return c.json({
@@ -2393,18 +2392,17 @@ app.get("/admin/brands/:id", async (c) => {
     select b.*, c.name as category_name
     from brands b left join categories c on c.id = b.category_id where b.id = ${id}`;
   if (!brandRows.length) return c.json({ error: "Brand not found" }, 404);
-  const [aliases, domains, redeemable, offers, candidates, review] = await Promise.all([
-    sql`select id, alias from brand_aliases where brand_id = ${id} order by alias`,
-    sql`select id, domain, is_primary from brand_domains where brand_id = ${id} order by is_primary desc, domain`,
-    sql`select id, domain from brand_redeemable_domains where brand_id = ${id} order by domain`,
-    sql`select provider_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
+  // Sequential (concurrent queries on one pooled connection can stall).
+  const aliases = await sql`select id, alias from brand_aliases where brand_id = ${id} order by alias`;
+  const domains = await sql`select id, domain, is_primary from brand_domains where brand_id = ${id} order by is_primary desc, domain`;
+  const redeemable = await sql`select id, domain from brand_redeemable_domains where brand_id = ${id} order by domain`;
+  const offers = await sql`select provider_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
         from v_brand_provider_offers where brand_id = ${id}
-        order by max_discount_percent desc nulls last`,
-    sql`select candidate_domain, score, google_rank, title, is_filtered
-        from brand_domain_candidates where brand_id = ${id} order by score desc nulls last`,
-    sql`select chosen_domain, score, status, reviewer_notes, reviewed_at
-        from brand_domain_reviews where brand_id = ${id}`,
-  ]);
+        order by max_discount_percent desc nulls last`;
+  const candidates = await sql`select candidate_domain, score, google_rank, title, is_filtered
+        from brand_domain_candidates where brand_id = ${id} order by score desc nulls last`;
+  const review = await sql`select chosen_domain, score, status, reviewer_notes, reviewed_at
+        from brand_domain_reviews where brand_id = ${id}`;
   return c.json({
     brand: brandRows[0],
     aliases,
