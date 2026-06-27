@@ -228,6 +228,9 @@ app.get("/brands", async (c) => {
         and v.max_discount_percent is not null
         and v.in_stock = true
         and v.product_url is not null
+        -- Exclude retail (giftcards.com, 0%) offers from the discount-ranked
+        -- browse listing; they surface only on the brand detail page.
+        and v.provider_slug <> 'giftcards'
         and (
           ${hasSearch} = false
           or lower(b.name) like lower(${searchPattern})
@@ -405,18 +408,25 @@ app.get("/brands/:slug", async (c) => {
     };
   });
 
+  // Retail providers (giftcards.com) sell at face value, i.e. 0% discount, but
+  // are still a valid clickable offer. Everyone else must beat 0% to show.
   const clickableOffers = offersAll.filter(
     (o) =>
       o.in_stock &&
-      o.discount_percent != null &&
-      o.discount_percent > 0 &&
       typeof o.product_url === "string" &&
-      o.product_url
+      o.product_url &&
+      (o.provider_slug === "giftcards"
+        ? o.discount_percent != null && o.discount_percent >= 0
+        : o.discount_percent != null && o.discount_percent > 0)
   );
 
+  // Headline discount ignores 0% retail offers so a brand isn't reported at 0%.
+  const discountedOffers = clickableOffers.filter(
+    (o) => o.discount_percent != null && o.discount_percent > 0
+  );
   const maxDiscount =
-    clickableOffers.length > 0
-      ? clickableOffers.reduce(
+    discountedOffers.length > 0
+      ? discountedOffers.reduce(
           (max, o) =>
             o.discount_percent != null && o.discount_percent > max
               ? o.discount_percent
@@ -571,7 +581,7 @@ app.get("/categories/:slug", async (c) => {
       count(distinct b.id) as total,
       max(v.max_discount_percent) as max_discount
     from brands b
-    left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
+    left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true and v.provider_slug <> 'giftcards'
     where b.category_id = ${categoryRow.id}
       and b.status = 'active'
   `;
@@ -585,7 +595,7 @@ app.get("/categories/:slug", async (c) => {
             max(v.max_discount_percent) as max_discount_percent,
             coalesce(bool_or(v.in_stock), false) as in_stock
           from brands b
-          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
+          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true and v.provider_slug <> 'giftcards'
           where b.category_id = ${categoryRow.id} and b.status = 'active'
           group by b.id, b.name, b.slug, b.base_domain
           order by b.name asc
@@ -597,7 +607,7 @@ app.get("/categories/:slug", async (c) => {
             max(v.max_discount_percent) as max_discount_percent,
             coalesce(bool_or(v.in_stock), false) as in_stock
           from brands b
-          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true
+          left join v_brand_provider_offers v on v.brand_id = b.id and v.in_stock = true and v.provider_slug <> 'giftcards'
           where b.category_id = ${categoryRow.id} and b.status = 'active'
           group by b.id, b.name, b.slug, b.base_domain
           order by max(v.max_discount_percent) desc nulls last, b.name asc
@@ -934,6 +944,7 @@ app.get("/analytics/popular-giftcards", async (c) => {
     from v_brand_provider_offers v
     join brands b on b.id = v.brand_id
     where v.in_stock = true and b.status = 'active'
+      and v.provider_slug <> 'giftcards'
     order by b.id, v.max_discount_percent desc
     limit ${limit}
   `;
@@ -990,6 +1001,7 @@ app.get("/analytics/top-discounts", async (c) => {
     where v.in_stock = true
       and b.status = 'active'
       and v.max_discount_percent is not null
+      and v.provider_slug <> 'giftcards'
     order by
       v.brand_id,
       v.max_discount_percent desc nulls last,
@@ -1753,6 +1765,7 @@ async function handleScheduled(env: Env) {
       left join categories c on c.id = b.category_id
       where pbd.in_stock = true
         and b.status = 'active'
+        and pbd.max_discount_percent > 0
         and b.slug = any(${slugs})
       group by b.id, b.name, b.slug, b.base_domain, c.name
     `;
@@ -1874,6 +1887,7 @@ app.get("/search-index", async (c) => {
     from brands b
     left join v_brand_provider_offers v
       on v.brand_id = b.id and v.in_stock = true and v.product_url is not null
+        and v.provider_slug <> 'giftcards'
     where b.status = 'active'
     group by b.id, b.name, b.slug, b.base_domain
     order by b.name

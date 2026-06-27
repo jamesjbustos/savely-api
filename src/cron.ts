@@ -11,11 +11,14 @@ type CronEnv = {
   DATABASE_URL: string;
 };
 
-type SamsClubCronEnv = CronEnv & {
+// Shared env for any cron that talks to the Rakuten Advertising APIs.
+type RakutenCronEnv = CronEnv & {
   RAKUTEN_CLIENT_ID: string;
   RAKUTEN_CLIENT_SECRET: string;
   RAKUTEN_SID: string; // publisher Site ID, used as OAuth scope
 };
+type SamsClubCronEnv = RakutenCronEnv;
+type GiftcardsCronEnv = RakutenCronEnv;
 
 const SAMS_CLUB_MID = "38733";
 const SAMS_CLUB_PROVIDER_SLUG = "samsclub";
@@ -23,6 +26,15 @@ const SAMS_CLUB_PROVIDER_NAME = "Sam's Club";
 const RAKUTEN_TOKEN_URL = "https://api.linksynergy.com/token";
 const RAKUTEN_PRODUCT_SEARCH_URL = "https://api.linksynergy.com/productsearch/1.0";
 const SAMS_CLUB_MAX_PAGES = 20; // hard cap; Sam's Club catalog is ~7 pages of 100
+
+// giftcards.com is a Rakuten advertiser (MID 44432). Unlike the discount
+// providers, it's a retail source: cards sell at face value, so every matched
+// product is written as a 0%-discount offer with the canonical Rakuten product
+// URL (no slug guessing, which is what produced dead "We're sorry" links).
+const GIFTCARDS_MID = "44432";
+const GIFTCARDS_PROVIDER_SLUG = "giftcards";
+const GIFTCARDS_PROVIDER_NAME = "Giftcards.com";
+const GIFTCARDS_MAX_PAGES = 60;
 
 /** Append Cardbay UTM tracking params to an outbound provider URL. */
 function withUtm(url: string, brandName: string): string {
@@ -1584,8 +1596,13 @@ export async function runBrandCategoryCron(env: CategoryCronEnv) {
  * spaces and apostrophes — caller should pass the result through
  * normalizeBrandKey() before lookup.
  */
-function extractSamsClubBrandText(title: string): string {
+function extractRetailBrandText(title: string): string {
   let t = title.toLowerCase();
+  // giftcards.com branding noise: "Shop X Gift Card at GiftCards.com",
+  // "X Physical Gift Card - Giftcards. com" (the period may be space-separated).
+  t = t.replace(/\bat\s+giftcards?\.?\s*com\b/g, " ");
+  t = t.replace(/\bgiftcards?\.?\s*com\b/g, " ");
+  t = t.replace(/^\s*shop\s+/, " ");
   // Quantity / multi-pack patterns: "3 x $25", "2x$15", "3 x 25"
   t = t.replace(/\b\d+\s*[x×]\s*\$?\d+(?:\.\d+)?\b/g, " ");
   // Dollar amounts: "$50", "$100.00"
@@ -1598,7 +1615,9 @@ function extractSamsClubBrandText(title: string): string {
   t = t.replace(/\bphysical (?:gift )?card\b/g, " ");
   t = t.replace(/\bmulti[\s-]?pack\b/g, " ");
   t = t.replace(/\bgift cards?\b/g, " ");
-  t = t.replace(/\begift\b/g, " ");
+  t = t.replace(/\be-?gift\b/g, " ");
+  // Lone "card"/"cards" left over from "eGift Card" / "Physical ... Card".
+  t = t.replace(/\bcards?\b/g, " ");
   t = t.replace(/\bvalue add\b/g, " ");
   t = t.replace(/\bvalue\b/g, " ");
   t = t.replace(/\bbonus\b/g, " ");
@@ -1635,7 +1654,7 @@ function extractSamsClubFaceValue(title: string): number | null {
   return null;
 }
 
-async function fetchSamsClubAccessToken(env: SamsClubCronEnv): Promise<string> {
+async function fetchRakutenAccessToken(env: RakutenCronEnv): Promise<string> {
   const basicAuth = Buffer.from(
     `${env.RAKUTEN_CLIENT_ID}:${env.RAKUTEN_CLIENT_SECRET}`
   ).toString("base64");
@@ -1649,16 +1668,16 @@ async function fetchSamsClubAccessToken(env: SamsClubCronEnv): Promise<string> {
   });
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Sam's Club cron: token fetch failed: ${resp.status} ${body}`);
+    throw new Error(`Rakuten cron: token fetch failed: ${resp.status} ${body}`);
   }
   const data = (await resp.json()) as { access_token?: string };
   if (!data.access_token) {
-    throw new Error("Sam's Club cron: no access_token in response");
+    throw new Error("Rakuten cron: no access_token in response");
   }
   return data.access_token;
 }
 
-type SamsClubProduct = {
+type RakutenProduct = {
   sku: string;
   productName: string;
   productUrl: string;
@@ -1667,23 +1686,24 @@ type SamsClubProduct = {
   saleprice: number;
 };
 
-async function fetchSamsClubProductsPage(
+async function fetchRakutenProductsPage(
   accessToken: string,
+  mid: string,
   pageNumber: number
-): Promise<{ products: SamsClubProduct[]; totalPages: number }> {
-  const url = `${RAKUTEN_PRODUCT_SEARCH_URL}?keyword=gift+card&mid=${SAMS_CLUB_MID}&max=100&pagenumber=${pageNumber}`;
+): Promise<{ products: RakutenProduct[]; totalPages: number }> {
+  const url = `${RAKUTEN_PRODUCT_SEARCH_URL}?keyword=gift+card&mid=${mid}&max=100&pagenumber=${pageNumber}`;
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!resp.ok) {
     throw new Error(
-      `Sam's Club cron: product fetch page ${pageNumber} failed: ${resp.status}`
+      `Rakuten cron: product fetch (mid ${mid}) page ${pageNumber} failed: ${resp.status}`
     );
   }
   const xml = await resp.text();
   const $ = loadHtml(xml, { xmlMode: true });
   const totalPages = parseInt($("TotalPages").text() || "1", 10) || 1;
-  const products: SamsClubProduct[] = [];
+  const products: RakutenProduct[] = [];
   $("item").each((_idx, el) => {
     const $item = $(el);
     products.push({
@@ -1757,7 +1777,7 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
   `;
 
   // 4) Fetch all pages, accumulate the highest-discount offer per brand.
-  const accessToken = await fetchSamsClubAccessToken(env);
+  const accessToken = await fetchRakutenAccessToken(env);
 
   type BestOffer = {
     brandId: string;
@@ -1776,8 +1796,9 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
   let totalPages = 1;
 
   while (pageNumber <= totalPages && pageNumber <= SAMS_CLUB_MAX_PAGES) {
-    const { products, totalPages: tp } = await fetchSamsClubProductsPage(
+    const { products, totalPages: tp } = await fetchRakutenProductsPage(
       accessToken,
+      SAMS_CLUB_MID,
       pageNumber
     );
     if (pageNumber === 1) totalPages = tp;
@@ -1805,7 +1826,7 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
         continue;
       }
 
-      const brandText = extractSamsClubBrandText(p.productName);
+      const brandText = extractRetailBrandText(p.productName);
       const brandKey = normalizeBrandKey(brandText);
       const brandId = brandKey ? brandIndex.get(brandKey) : null;
       if (!brandId) {
@@ -1906,4 +1927,244 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
   `;
 
   console.log(`Sam's Club cron: upserted ${upserted} brand offers.`);
+}
+
+// ---------------------------------------------------------------------------
+// Giftcards.com cron
+// ---------------------------------------------------------------------------
+//
+// giftcards.com is a Rakuten advertiser (MID 44432) selling cards at face
+// value. We pull its catalog from the same Rakuten Product Search API used by
+// Sam's Club and write one 0%-discount ("retail") offer per matched brand, with
+// the canonical Rakuten product URL. Brand matching is STRICT normalized
+// name/slug/alias lookup (no fuzzy/substring), with a curated override map to
+// bridge cases where giftcards.com's product naming differs from our brand name
+// (e.g. "Microsoft Xbox" -> xbox, "Domino's Pizza" -> dominos). Unmatched
+// products are dropped — same discipline as the Sam's Club cron.
+
+// Normalized giftcards.com product brand-text -> our brand slug. Keys are the
+// output of normalizeBrandKey(extractRetailBrandText(productName)). Only needed
+// where the giftcards.com product NAME differs from our brand name; URL-slug
+// differences don't matter here because we match on the Rakuten product name.
+// Refine via the run-giftcards-cron.ts DRY_RUN unmatched log.
+const GIFTCARDS_BRAND_OVERRIDES: Record<string, string> = {
+  "microsoft xbox": "xbox",
+  "dominos pizza": "dominos",
+  "playstation store": "playstation",
+  "sony playstation store": "playstation",
+};
+
+export async function runGiftcardsComCron(
+  env: GiftcardsCronEnv,
+  opts: { dryRun?: boolean } = {}
+) {
+  const dryRun = !!opts.dryRun;
+  const sql = getDb(env);
+
+  // 1) Ensure provider exists
+  await sql/* sql */ `
+    insert into providers (name, slug)
+    values (${GIFTCARDS_PROVIDER_NAME}, ${GIFTCARDS_PROVIDER_SLUG})
+    on conflict (slug) do nothing
+  `;
+  const providerRow = await sql/* sql */ `
+    select id from providers where slug = ${GIFTCARDS_PROVIDER_SLUG} limit 1
+  `;
+  if (!providerRow?.[0]?.id) {
+    console.error("Giftcards.com cron: failed to resolve provider id");
+    return;
+  }
+  const providerId = providerRow[0].id as string;
+
+  // 2) Build a strict brand lookup index from active brands + aliases.
+  const brandRows = await sql/* sql */ `
+    select id, name, slug from brands where status = 'active'
+  `;
+  const aliasRows = await sql/* sql */ `
+    select brand_id, alias from brand_aliases
+  `;
+
+  const brandIndex = new Map<string, string>(); // normalized key -> brand_id
+  const brandIdToSlug = new Map<string, string>(); // for logging
+  for (const b of brandRows as any[]) {
+    const id = b.id as string;
+    brandIdToSlug.set(id, b.slug as string);
+    const nameKey = normalizeBrandKey(b.name as string);
+    const slugKey = normalizeBrandKey(b.slug as string);
+    if (nameKey) brandIndex.set(nameKey, id);
+    if (slugKey && !brandIndex.has(slugKey)) brandIndex.set(slugKey, id);
+  }
+  for (const a of aliasRows as any[]) {
+    const aliasKey = normalizeBrandKey(a.alias as string);
+    if (aliasKey && !brandIndex.has(aliasKey)) {
+      brandIndex.set(aliasKey, a.brand_id as string);
+    }
+  }
+  console.log(`Giftcards.com cron: brand index has ${brandIndex.size} keys`);
+
+  const resolveBrandId = (productBrandKey: string): string | null => {
+    if (!productBrandKey) return null;
+    const direct = brandIndex.get(productBrandKey);
+    if (direct) return direct;
+    const overrideSlug = GIFTCARDS_BRAND_OVERRIDES[productBrandKey];
+    if (overrideSlug) {
+      const viaOverride = brandIndex.get(normalizeBrandKey(overrideSlug));
+      if (viaOverride) return viaOverride;
+    }
+    return null;
+  };
+
+  // 3) Fetch all pages, keep one (canonical) product per brand. Retail: no
+  //    discount filtering — every matched product is a 0% offer.
+  const accessToken = await fetchRakutenAccessToken(env);
+
+  type RetailOffer = {
+    brandId: string;
+    sku: string;
+    productName: string;
+    productUrl: string;
+  };
+  const bestPerBrand = new Map<string, RetailOffer>();
+
+  let totalProducts = 0;
+  let matchedProducts = 0;
+  const unmatched: string[] = [];
+  let pageNumber = 1;
+  let totalPages = 1;
+
+  while (pageNumber <= totalPages && pageNumber <= GIFTCARDS_MAX_PAGES) {
+    const { products, totalPages: tp } = await fetchRakutenProductsPage(
+      accessToken,
+      GIFTCARDS_MID,
+      pageNumber
+    );
+    if (pageNumber === 1) totalPages = tp;
+    totalProducts += products.length;
+
+    for (const p of products) {
+      if (!p.sku || !p.productUrl) continue;
+
+      const brandKey = normalizeBrandKey(extractRetailBrandText(p.productName));
+      const brandId = resolveBrandId(brandKey);
+      if (!brandId) {
+        unmatched.push(p.productName);
+        continue;
+      }
+
+      matchedProducts++;
+      const existing = bestPerBrand.get(brandId);
+      // Prefer the most canonical product per brand: shorter title wins (e.g.
+      // "Starbucks Gift Card" over "Starbucks Holiday Bonus eGift Card").
+      if (!existing || p.productName.length < existing.productName.length) {
+        bestPerBrand.set(brandId, {
+          brandId,
+          sku: p.sku,
+          productName: p.productName,
+          productUrl: p.productUrl,
+        });
+      }
+    }
+
+    pageNumber++;
+  }
+
+  console.log(
+    `Giftcards.com cron: scanned ${totalProducts} products across ${pageNumber - 1} pages; ` +
+      `matched ${matchedProducts}, brands chosen ${bestPerBrand.size}, ` +
+      `dropped ${unmatched.length} unmatched`
+  );
+
+  if (dryRun) {
+    console.log("\n--- DRY RUN: matched brands ---");
+    for (const o of bestPerBrand.values()) {
+      console.log(`  ${brandIdToSlug.get(o.brandId)} <- "${o.productName}"`);
+    }
+    console.log("\n--- DRY RUN: unmatched product names ---");
+    for (const name of unmatched) console.log(`  ${name}`);
+    console.log("\nDRY RUN: no database writes performed.");
+    return;
+  }
+
+  // 4) Mark all current giftcards state out of stock; the upsert loop re-confirms.
+  const nowTs = new Date().toISOString();
+  await sql/* sql */ `
+    update provider_brand_discounts
+    set in_stock = false, fetched_at = ${nowTs}
+    where provider_id = ${providerId}
+  `;
+  await sql/* sql */ `
+    update provider_brand_products
+    set is_active = false, last_checked_at = ${nowTs}
+    where provider_id = ${providerId}
+  `;
+
+  // 5) Persist the chosen offers. One product per brand at 0% (retail).
+  let upserted = 0;
+  for (const offer of bestPerBrand.values()) {
+    await sql/* sql */ `
+      delete from provider_brand_products
+      where provider_id = ${providerId}
+        and brand_id = ${offer.brandId}
+        and (variant <> 'online' or coalesce(product_external_id, '') <> ${offer.sku})
+    `;
+
+    await sql/* sql */ `
+      insert into provider_brand_products
+        (provider_id, brand_id, variant, product_external_id, product_url,
+         is_active, last_seen_at, last_checked_at, discount_percent)
+      values
+        (${providerId}, ${offer.brandId}, 'online', ${offer.sku}, ${offer.productUrl},
+         true, ${nowTs}, ${nowTs}, 0)
+      on conflict do nothing
+    `;
+    await sql/* sql */ `
+      update provider_brand_products
+      set product_url = ${offer.productUrl},
+          is_active = true,
+          last_seen_at = ${nowTs},
+          last_checked_at = ${nowTs},
+          discount_percent = 0
+      where provider_id = ${providerId}
+        and brand_id = ${offer.brandId}
+        and variant = 'online'
+        and coalesce(product_external_id, '') = ${offer.sku}
+    `;
+
+    await sql/* sql */ `
+      insert into provider_brand_discounts
+        (provider_id, brand_id, max_discount_percent, in_stock, fetched_at)
+      values
+        (${providerId}, ${offer.brandId}, 0, true, ${nowTs})
+      on conflict (provider_id, brand_id)
+      do update set
+        max_discount_percent = 0,
+        in_stock = true,
+        fetched_at = ${nowTs}
+    `;
+    upserted++;
+  }
+
+  // 6) Append history snapshot only for brands whose state changed
+  await sql/* sql */ `
+    insert into provider_brand_discount_history (
+      provider_id, brand_id, max_discount_percent, in_stock, observed_at
+    )
+    select pbd.provider_id, pbd.brand_id, pbd.max_discount_percent, pbd.in_stock, pbd.fetched_at
+    from provider_brand_discounts pbd
+    left join lateral (
+      select max_discount_percent, in_stock
+      from provider_brand_discount_history h
+      where h.provider_id = pbd.provider_id and h.brand_id = pbd.brand_id
+      order by observed_at desc
+      limit 1
+    ) last on true
+    where pbd.provider_id = ${providerId}
+      and (
+        last.max_discount_percent is null
+        or last.max_discount_percent is distinct from pbd.max_discount_percent
+        or last.in_stock is distinct from pbd.in_stock
+      )
+  `;
+
+  console.log(`Giftcards.com cron: upserted ${upserted} brand offers.`);
 }
