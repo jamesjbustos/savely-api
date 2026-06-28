@@ -2258,6 +2258,59 @@ app.post("/admin/unmatched-products/auto-match", async (c) => {
   return c.json({ ok: true, ...res });
 });
 
+// Bulk-accept the suggested brand for every queued product whose fuzzy
+// confidence is >= min_score (0-100). One human action clears the obviously-
+// correct high-confidence rows; low-confidence ones are left for manual review.
+app.post("/admin/unmatched-products/accept-suggested", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => ({}))) as any;
+  const providerSlug = String(body?.provider || "").trim();
+  const minScore = Math.max(50, Math.min(100, Number(body?.min_score) || 90));
+  const min = minScore / 100;
+
+  const brandRows = await sql/* sql */ `
+    select id, name, slug, base_domain from brands where status = 'active'
+  `;
+  const brandLite = buildBrandLite(brandRows as any[]);
+  const queue = await sql/* sql */ `
+    select u.id, u.normalized_key
+    from provider_unmatched_products u
+    join providers p on p.id = u.provider_id
+    where u.dismissed = false
+      and (${providerSlug} = '' or p.slug = ${providerSlug})
+  `;
+  const aliasInserts: { brand_id: string; alias: string }[] = [];
+  const matchedIds: string[] = [];
+  const seen = new Set<string>();
+  for (const r of queue as any[]) {
+    const key = String(r.normalized_key || "").trim();
+    if (!key) continue;
+    const cand = bestCandidate(key, brandLite, min);
+    if (!cand) continue;
+    matchedIds.push(r.id);
+    const d = `${cand.brand.id}::${key}`;
+    if (!seen.has(d)) {
+      seen.add(d);
+      aliasInserts.push({ brand_id: cand.brand.id, alias: key });
+    }
+  }
+  if (aliasInserts.length > 0) {
+    await sql/* sql */ `
+      insert into brand_aliases ${sql(aliasInserts, "brand_id", "alias")}
+      on conflict do nothing
+    `;
+  }
+  if (matchedIds.length > 0) {
+    await sql/* sql */ `delete from provider_unmatched_products where id = any(${matchedIds})`;
+  }
+  await recordAudit(sql, c, "accept_suggested_unmatched", "provider", providerSlug || null, {
+    accepted: matchedIds.length,
+    aliases: aliasInserts.length,
+    min_score: minScore,
+  });
+  return c.json({ ok: true, accepted: matchedIds.length, aliases: aliasInserts.length });
+});
+
 // ── Dashboard stats ──────────────────────────────────────────────
 app.get("/admin/dashboard-stats", async (c) => {
   const sql = getDb(c.env);
