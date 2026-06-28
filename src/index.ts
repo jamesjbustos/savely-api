@@ -1991,10 +1991,13 @@ app.get("/admin/pending-brands", async (c) => {
       select id, name, slug, base_domain, status
       from brands b
       where b.status <> 'pending' and b.id <> p.id
-        and (
-          b.slug ilike '%' || p.slug || '%'
-          or p.slug ilike '%' || b.slug || '%'
-          or lower(b.name) ilike '%' || lower(p.name) || '%'
+        -- Share a whole slug token (>= 4 chars) — avoids substring false positives
+        -- like "on" matching "burlingt(on)".
+        and exists (
+          select 1
+          from unnest(string_to_array(p.slug, '-')) pt
+          join unnest(string_to_array(b.slug, '-')) bt on bt = pt
+          where length(pt) >= 4
         )
       order by b.status desc, lower(b.name)
       limit 5
@@ -2045,7 +2048,7 @@ app.patch("/admin/brands/:id", async (c) => {
   const desiredCategory =
     body.category_id !== undefined ? body.category_id : curRow.category_id;
 
-  if (desiredStatus !== "pending" && desiredStatus !== "active") {
+  if (!["pending", "active", "rejected"].includes(desiredStatus)) {
     return c.json({ error: "Invalid status" }, 400);
   }
   if (
