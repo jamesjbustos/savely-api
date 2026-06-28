@@ -58,6 +58,7 @@ export interface BrandLite {
   base_domain?: string | null;
   key: string; // normalizeBrandKey(name)
   tokens: Set<string>;
+  tri: Set<string>; // precomputed char trigrams of key (reused across all rows)
 }
 
 /** Build the lightweight, pre-normalized brand list scoring works against. */
@@ -75,6 +76,7 @@ export function buildBrandLite(
       base_domain: r.base_domain ?? null,
       key,
       tokens: new Set(tokenize(key)),
+      tri: trigrams(key),
     });
   }
   return out;
@@ -169,27 +171,75 @@ export interface Candidate {
   reason: string;
 }
 
+/** Dice coefficient between two precomputed trigram sets. */
+function diceSets(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  const [small, large] = a.size < b.size ? [a, b] : [b, a];
+  let inter = 0;
+  for (const g of small) if (large.has(g)) inter++;
+  return (2 * inter) / (a.size + b.size);
+}
+
+export interface Matcher {
+  best(productKey: string, min?: number): Candidate | null;
+}
+
 /**
- * Best fuzzy brand guess for an unmatched key. Returns null below `min` so the
- * UI only suggests something worth a glance.
+ * Build a reusable scorer over a brand list. Precomputes a token→brands index
+ * and reuses each brand's precomputed trigrams, so scoring a row only touches
+ * brands that share a token with it (not all N brands). Essential at scale —
+ * a naive all-pairs trigram scan over thousands of rows blows the Worker CPU
+ * budget. Results are memoized per (key, min).
  */
+export function buildMatcher(brands: BrandLite[]): Matcher {
+  const tokenIndex = new Map<string, BrandLite[]>();
+  for (const b of brands) {
+    for (const t of b.tokens) {
+      let arr = tokenIndex.get(t);
+      if (!arr) tokenIndex.set(t, (arr = []));
+      arr.push(b);
+    }
+  }
+  const cache = new Map<string, Candidate | null>();
+
+  function best(productKey: string, min = 0.4): Candidate | null {
+    const pk = productKey.trim();
+    if (!pk) return null;
+    const ck = `${min}|${pk}`;
+    const cached = cache.get(ck);
+    if (cached !== undefined) return cached;
+
+    const pt = new Set(tokenize(pk));
+    const ptri = trigrams(pk);
+    // Only consider brands sharing at least one token with the product.
+    const candidates = new Set<BrandLite>();
+    for (const t of pt) {
+      const arr = tokenIndex.get(t);
+      if (arr) for (const b of arr) candidates.add(b);
+    }
+    let top: Candidate | null = null;
+    for (const b of candidates) {
+      const tri = diceSets(ptri, b.tri);
+      const jac = jaccard(pt, b.tokens);
+      const contained = isSubset(b.tokens, pt) || isSubset(pt, b.tokens);
+      const score = Math.min(1, Math.max(tri, jac) + (contained ? 0.1 : 0));
+      if (!top || score > top.score) {
+        top = { brand: b, score, reason: contained ? "overlap" : "fuzzy" };
+      }
+    }
+    const res = top && top.score >= min ? top : null;
+    cache.set(ck, res);
+    return res;
+  }
+
+  return { best };
+}
+
+/** One-shot convenience wrapper around buildMatcher (for single lookups). */
 export function bestCandidate(
   productKey: string,
   brands: BrandLite[],
   min = 0.4,
 ): Candidate | null {
-  const pk = productKey.trim();
-  if (!pk) return null;
-  const pt = new Set(tokenize(pk));
-  let best: Candidate | null = null;
-  for (const b of brands) {
-    const tri = trigramSimilarity(pk, b.key);
-    const jac = jaccard(pt, b.tokens);
-    const contained = isSubset(b.tokens, pt) || isSubset(pt, b.tokens);
-    const score = Math.min(1, Math.max(tri, jac) + (contained ? 0.1 : 0));
-    if (!best || score > best.score) {
-      best = { brand: b, score, reason: contained ? "overlap" : "fuzzy" };
-    }
-  }
-  return best && best.score >= min ? best : null;
+  return buildMatcher(brands).best(productKey, min);
 }

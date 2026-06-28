@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { getDb } from "./db.ts";
-import { buildBrandLite, bestCandidate, safeAutoMatch } from "./brandMatch.ts";
+import { buildBrandLite, buildMatcher, safeAutoMatch } from "./brandMatch.ts";
 
 type Env = {
   DATABASE_URL: string;
@@ -2195,9 +2195,9 @@ app.get("/admin/unmatched-products", async (c) => {
   const brandRows = await sql/* sql */ `
     select id, name, slug, base_domain from brands where status = 'active'
   `;
-  const brandLite = buildBrandLite(brandRows as any[]);
+  const matcher = buildMatcher(buildBrandLite(brandRows as any[]));
   for (const p of products as any[]) {
-    const cand = p.normalized_key ? bestCandidate(p.normalized_key, brandLite) : null;
+    const cand = p.normalized_key ? matcher.best(p.normalized_key) : null;
     p.suggested = cand
       ? {
           brand_id: cand.brand.id,
@@ -2271,7 +2271,7 @@ app.post("/admin/unmatched-products/accept-suggested", async (c) => {
   const brandRows = await sql/* sql */ `
     select id, name, slug, base_domain from brands where status = 'active'
   `;
-  const brandLite = buildBrandLite(brandRows as any[]);
+  const matcher = buildMatcher(buildBrandLite(brandRows as any[]));
   const queue = await sql/* sql */ `
     select u.id, u.normalized_key
     from provider_unmatched_products u
@@ -2285,7 +2285,7 @@ app.post("/admin/unmatched-products/accept-suggested", async (c) => {
   for (const r of queue as any[]) {
     const key = String(r.normalized_key || "").trim();
     if (!key) continue;
-    const cand = bestCandidate(key, brandLite, min);
+    const cand = matcher.best(key, min);
     if (!cand) continue;
     matchedIds.push(r.id);
     const d = `${cand.brand.id}::${key}`;
