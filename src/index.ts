@@ -2075,7 +2075,7 @@ app.patch("/admin/brands/:id", async (c) => {
   const updated = await sql`
     select id, name, slug, base_domain, status, category_id from brands where id = ${id}`;
   const slug = updated[0]?.slug as string | undefined;
-  if (slug) await purgeCached(c, [`/brands/${slug}`]);
+  await purgeCached(c, [...(slug ? [`/brands/${slug}`] : []), "/search-index"]);
   return c.json({ brand: updated[0] });
 });
 
@@ -2438,7 +2438,7 @@ app.post("/admin/brands/merge", async (c) => {
     discard_id: body.discard_id,
   });
   const keepSlug = (keepRow[0]?.slug as string) ?? null;
-  if (keepSlug) await purgeCached(c, [`/brands/${keepSlug}`]);
+  await purgeCached(c, [...(keepSlug ? [`/brands/${keepSlug}`] : []), "/search-index"]);
   return c.json({ ok: true, keep_slug: keepSlug });
 });
 
