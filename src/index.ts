@@ -1958,11 +1958,19 @@ app.get("/admin/pending-brands", async (c) => {
     select brand_id, chosen_domain, score, status, reviewer_notes, reviewed_at
     from brand_domain_reviews
     where brand_id = any(${ids}::uuid[])`;
+  // Provider offers (incl. the affiliate/product URL) so admins can preview the link.
+  const offers = await sql`
+    select brand_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
+    from v_brand_provider_offers
+    where brand_id = any(${ids}::uuid[])
+    order by max_discount_percent desc nulls last`;
 
   const candByBrand: Record<string, unknown[]> = {};
   for (const r of candidates) (candByBrand[r.brand_id as string] ??= []).push(r);
   const reviewByBrand: Record<string, unknown> = {};
   for (const r of reviews) reviewByBrand[r.brand_id as string] = r;
+  const offersByBrand: Record<string, unknown[]> = {};
+  for (const r of offers) (offersByBrand[r.brand_id as string] ??= []).push(r);
 
   return c.json({
     page,
@@ -1972,6 +1980,7 @@ app.get("/admin/pending-brands", async (c) => {
       ...b,
       candidates: candByBrand[b.id as string] ?? [],
       review: reviewByBrand[b.id as string] ?? null,
+      offers: offersByBrand[b.id as string] ?? [],
     })),
   });
 });
