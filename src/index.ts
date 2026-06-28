@@ -129,6 +129,24 @@ function cacheResponse(
   return response;
 }
 
+// Invalidate cached GET responses for the given paths (relative to the current
+// request origin). Used after admin writes so brand pages reflect changes
+// immediately instead of waiting for the cache TTL. The web app's reads and
+// admin writes both flow through the same Cloudflare colo (origin = the VPS),
+// so this per-colo Cache API delete reliably purges what the web app reads.
+async function purgeCached(c: any, paths: string[]) {
+  const cache = getCache() as { delete?(req: Request): Promise<boolean> } | null;
+  if (!cache || typeof cache.delete !== "function") return;
+  for (const p of paths) {
+    try {
+      const url = new URL(p, c.req.url).toString();
+      await cache.delete(new Request(url, { method: "GET" }));
+    } catch (err) {
+      console.error("purgeCached error:", err);
+    }
+  }
+}
+
 function variantToLabel(variant: string | null | undefined): string | null {
   if (!variant) return null;
   if (variant === "online") return "Online";
@@ -2053,6 +2071,8 @@ app.patch("/admin/brands/:id", async (c) => {
   await sql`update brands set ${sql(update)}, updated_at = now() where id = ${id}`;
   const updated = await sql`
     select id, name, slug, base_domain, status, category_id from brands where id = ${id}`;
+  const slug = updated[0]?.slug as string | undefined;
+  if (slug) await purgeCached(c, [`/brands/${slug}`]);
   return c.json({ brand: updated[0] });
 });
 
@@ -2409,11 +2429,14 @@ app.post("/admin/brands/merge", async (c) => {
   if (body.keep_id === body.discard_id) {
     return c.json({ error: "keep and discard must differ" }, 400);
   }
+  const keepRow = await sql`select slug from brands where id = ${body.keep_id}`;
   await sql`select merge_brands(${body.keep_id}::uuid, ${body.discard_id}::uuid)`;
   await recordAudit(sql, c, "merge_brands", "brand", String(body.keep_id), {
     discard_id: body.discard_id,
   });
-  return c.json({ ok: true });
+  const keepSlug = (keepRow[0]?.slug as string) ?? null;
+  if (keepSlug) await purgeCached(c, [`/brands/${keepSlug}`]);
+  return c.json({ ok: true, keep_slug: keepSlug });
 });
 
 app.get("/admin/brands/:id", async (c) => {
