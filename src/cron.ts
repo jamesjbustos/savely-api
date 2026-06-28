@@ -6,6 +6,12 @@ import {
   mapVariantFromStrings,
 } from "./brandUtils.ts";
 import { mapIabToCategory } from "./categoryMapping.ts";
+import {
+  normalizeBrandKey,
+  safeAutoMatch,
+  buildBrandLite,
+  type BrandLite,
+} from "./brandMatch.ts";
 
 type CronEnv = {
   DATABASE_URL: string;
@@ -1627,19 +1633,6 @@ function extractRetailBrandText(title: string): string {
   return t.replace(/\s+/g, " ").trim();
 }
 
-/** Normalize a name so "Applebee's", "applebees", and "Apple Bee's" collapse to one key. */
-function normalizeBrandKey(s: string): string {
-  return s
-    .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "") // strip diacritics: "Aéropostale" -> "aeropostale"
-    .toLowerCase()
-    .replace(/['']/g, "")
-    .replace(/&/g, "and")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 /** Pull a face value (e.g. 50 from "Olive Garden $50 Gift Card") from a Sam's Club product title. */
 function extractSamsClubFaceValue(title: string): number | null {
   const dollarMatch = title.match(/\$\s*(\d+(?:\.\d+)?)/);
@@ -1764,6 +1757,23 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
   }
   console.log(`Sam's Club cron: brand index has ${brandIndex.size} keys`);
 
+  // Conservative fuzzy fallback (subset/+&-fold) for keys the strict index
+  // misses. Matched in-memory only — no alias written.
+  const samsBrandList: BrandLite[] = buildBrandLite(brandRows as any[]);
+  const samsSafeCache = new Map<string, string | null>();
+  let samsAutoMatched = 0;
+  const resolveSamsBrandId = (brandKey: string): string | null => {
+    if (!brandKey) return null;
+    const direct = brandIndex.get(brandKey);
+    if (direct) return direct;
+    if (samsSafeCache.has(brandKey)) return samsSafeCache.get(brandKey)!;
+    const safe = safeAutoMatch(brandKey, samsBrandList);
+    const id = safe?.brandId ?? null;
+    if (id) samsAutoMatched++;
+    samsSafeCache.set(brandKey, id);
+    return id;
+  };
+
   // 3) Mark all current Sam's Club state out of stock; the upsert loop will
   //    flip back any brand we re-confirm.
   const nowTs = new Date().toISOString();
@@ -1830,7 +1840,7 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
 
       const brandText = extractRetailBrandText(p.productName);
       const brandKey = normalizeBrandKey(brandText);
-      const brandId = brandKey ? brandIndex.get(brandKey) : null;
+      const brandId = resolveSamsBrandId(brandKey);
       if (!brandId) {
         droppedNoBrand++;
         continue;
@@ -1854,7 +1864,8 @@ export async function runSamsClubCron(env: SamsClubCronEnv) {
 
   console.log(
     `Sam's Club cron: scanned ${totalProducts} products across ${pageNumber - 1} pages; ` +
-      `matched ${matchedProducts}, brands chosen ${bestPerBrand.size}, ` +
+      `matched ${matchedProducts} (${samsAutoMatched} via safe fuzzy fallback), ` +
+      `brands chosen ${bestPerBrand.size}, ` +
       `dropped ${droppedNoBrand} unmatched, ${droppedNoDiscount} no-discount`
   );
 
@@ -2004,6 +2015,13 @@ export async function runGiftcardsComCron(
   }
   console.log(`Giftcards.com cron: brand index has ${brandIndex.size} keys`);
 
+  // Pre-normalized brand list for the conservative fuzzy fallback (subset match).
+  const brandList: BrandLite[] = buildBrandLite(brandRows as any[]);
+  // Memoize fallback results — the catalog repeats the same brand name across
+  // many SKUs/pages, so we only scan brandList once per distinct key.
+  const safeCache = new Map<string, string | null>();
+  let autoMatched = 0;
+
   const resolveBrandId = (productBrandKey: string): string | null => {
     if (!productBrandKey) return null;
     const direct = brandIndex.get(productBrandKey);
@@ -2013,7 +2031,16 @@ export async function runGiftcardsComCron(
       const viaOverride = brandIndex.get(normalizeBrandKey(overrideSlug));
       if (viaOverride) return viaOverride;
     }
-    return null;
+    // Conservative fuzzy fallback: provably-safe, unambiguous subset matches
+    // only (e.g. "academy sports and outdoors store" → "Academy Sports +
+    // Outdoors"). Matched in-memory for this run — no alias is written, so a
+    // criteria change re-evaluates cleanly next run.
+    if (safeCache.has(productBrandKey)) return safeCache.get(productBrandKey)!;
+    const safe = safeAutoMatch(productBrandKey, brandList);
+    const id = safe?.brandId ?? null;
+    if (id) autoMatched++;
+    safeCache.set(productBrandKey, id);
+    return id;
   };
 
   // 3) Fetch all pages, keep one (canonical) product per brand. Retail: no
@@ -2083,8 +2110,8 @@ export async function runGiftcardsComCron(
 
   console.log(
     `Giftcards.com cron: scanned ${totalProducts} products across ${pageNumber - 1} pages; ` +
-      `matched ${matchedProducts}, brands chosen ${bestPerBrand.size}, ` +
-      `dropped ${unmatched.size} unmatched`
+      `matched ${matchedProducts} (${autoMatched} via safe fuzzy fallback), ` +
+      `brands chosen ${bestPerBrand.size}, dropped ${unmatched.size} unmatched`
   );
 
   if (dryRun) {

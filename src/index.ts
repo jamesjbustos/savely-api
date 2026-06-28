@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { getDb } from "./db.ts";
+import { buildBrandLite, bestCandidate, safeAutoMatch } from "./brandMatch.ts";
 
 type Env = {
   DATABASE_URL: string;
@@ -2110,6 +2111,54 @@ function adminPage(c: any) {
   return Math.max(1, Number.parseInt(c.req.query("page") || "1", 10) || 1);
 }
 
+/**
+ * Resolve every provably-safe, unambiguous match across the (optionally
+ * provider-scoped) unmatched queue: write an alias for each and clear the row.
+ * Conservative — see safeAutoMatch(). Runs automatically when the queue is read
+ * so perfect matches never reach the review list. Idempotent.
+ */
+async function autoResolveSafeMatches(
+  sql: any,
+  providerSlug: string,
+): Promise<{ matched: number; aliases: number }> {
+  const brandRows = await sql/* sql */ `
+    select id, name, slug, base_domain from brands where status = 'active'
+  `;
+  const brandLite = buildBrandLite(brandRows as any[]);
+  const queue = await sql/* sql */ `
+    select u.id, u.normalized_key
+    from provider_unmatched_products u
+    join providers p on p.id = u.provider_id
+    where u.dismissed = false
+      and (${providerSlug} = '' or p.slug = ${providerSlug})
+  `;
+  const aliasInserts: { brand_id: string; alias: string }[] = [];
+  const matchedIds: string[] = [];
+  const seen = new Set<string>();
+  for (const r of queue as any[]) {
+    const key = String(r.normalized_key || "").trim();
+    if (!key) continue;
+    const safe = safeAutoMatch(key, brandLite);
+    if (!safe) continue;
+    matchedIds.push(r.id);
+    const d = `${safe.brandId}::${key}`;
+    if (!seen.has(d)) {
+      seen.add(d);
+      aliasInserts.push({ brand_id: safe.brandId, alias: key });
+    }
+  }
+  if (aliasInserts.length > 0) {
+    await sql/* sql */ `
+      insert into brand_aliases ${sql(aliasInserts, "brand_id", "alias")}
+      on conflict do nothing
+    `;
+  }
+  if (matchedIds.length > 0) {
+    await sql/* sql */ `delete from provider_unmatched_products where id = any(${matchedIds})`;
+  }
+  return { matched: matchedIds.length, aliases: aliasInserts.length };
+}
+
 // ── Matching queue (keystone) ────────────────────────────────────
 app.get("/admin/unmatched-products", async (c) => {
   const sql = getDb(c.env);
@@ -2119,6 +2168,14 @@ app.get("/admin/unmatched-products", async (c) => {
   const perPage = 50;
   const offset = (page - 1) * perPage;
   const like = `%${q}%`;
+
+  // Auto-resolve safe matches before listing so the queue only ever shows rows
+  // that need a human. Only on the unfiltered first page (cheap once drained).
+  let autoResolved = 0;
+  if (page === 1 && q === "") {
+    autoResolved = (await autoResolveSafeMatches(sql, providerSlug)).matched;
+  }
+
   const rows = await sql/* sql */ `
     select u.id, u.provider_id, p.slug as provider_slug, p.name as provider_name,
            u.product_external_id, u.product_name, u.product_url, u.normalized_key,
@@ -2131,12 +2188,31 @@ app.get("/admin/unmatched-products", async (c) => {
     order by u.last_seen_at desc
     limit ${perPage} offset ${offset}`;
   const total = rows[0] ? Number(rows[0].total_count) : 0;
-  return c.json({
-    page,
-    per_page: perPage,
-    total,
-    products: rows.map(({ total_count, ...r }: any) => r),
-  });
+
+  // Attach a best-guess brand suggestion to each row for the one-click review
+  // tier. Score the page's rows against the active brand list in-memory.
+  const products = rows.map(({ total_count, ...r }: any) => r);
+  const brandRows = await sql/* sql */ `
+    select id, name, slug, base_domain from brands where status = 'active'
+  `;
+  const brandLite = buildBrandLite(brandRows as any[]);
+  for (const p of products as any[]) {
+    const cand = p.normalized_key ? bestCandidate(p.normalized_key, brandLite) : null;
+    p.suggested = cand
+      ? {
+          brand_id: cand.brand.id,
+          name: cand.brand.name,
+          slug: cand.brand.slug,
+          base_domain: cand.brand.base_domain ?? null,
+          score: Math.round(cand.score * 100),
+          reason: cand.reason,
+        }
+      : null;
+  }
+  // Strongest suggestions first within the page so the easy ✓s are up top.
+  products.sort((a: any, b: any) => (b.suggested?.score ?? -1) - (a.suggested?.score ?? -1));
+
+  return c.json({ page, per_page: perPage, total, products, auto_resolved: autoResolved });
 });
 
 app.post("/admin/unmatched-products/match", async (c) => {
@@ -2169,6 +2245,17 @@ app.post("/admin/unmatched-products/dismiss", async (c) => {
   await sql`update provider_unmatched_products set dismissed = true where id = ${body.id}`;
   await recordAudit(sql, c, "dismiss_unmatched_product", "unmatched_product", String(body.id), null);
   return c.json({ ok: true });
+});
+
+// Manual trigger for the safe auto-match pass (also runs automatically on read,
+// and in the crons). Kept for one-off/scripted runs.
+app.post("/admin/unmatched-products/auto-match", async (c) => {
+  const sql = getDb(c.env);
+  const body = (await c.req.json().catch(() => ({}))) as any;
+  const providerSlug = String(body?.provider || "").trim();
+  const res = await autoResolveSafeMatches(sql, providerSlug);
+  await recordAudit(sql, c, "auto_match_unmatched_products", "provider", providerSlug || null, res);
+  return c.json({ ok: true, ...res });
 });
 
 // ── Dashboard stats ──────────────────────────────────────────────
