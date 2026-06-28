@@ -1964,6 +1964,23 @@ app.get("/admin/pending-brands", async (c) => {
     from v_brand_provider_offers
     where brand_id = any(${ids}::uuid[])
     order by max_discount_percent desc nulls last`;
+  // Likely existing (non-pending) brands this pending one may be a duplicate of,
+  // by name/slug substring — for one-click "merge into existing".
+  const matches = await sql`
+    select p.id as pending_id, m.id, m.name, m.slug, m.base_domain, m.status
+    from (select id, name, slug from brands where id = any(${ids}::uuid[])) p
+    join lateral (
+      select id, name, slug, base_domain, status
+      from brands b
+      where b.status <> 'pending' and b.id <> p.id
+        and (
+          b.slug ilike '%' || p.slug || '%'
+          or p.slug ilike '%' || b.slug || '%'
+          or lower(b.name) ilike '%' || lower(p.name) || '%'
+        )
+      order by b.status desc, lower(b.name)
+      limit 5
+    ) m on true`;
 
   const candByBrand: Record<string, unknown[]> = {};
   for (const r of candidates) (candByBrand[r.brand_id as string] ??= []).push(r);
@@ -1971,6 +1988,10 @@ app.get("/admin/pending-brands", async (c) => {
   for (const r of reviews) reviewByBrand[r.brand_id as string] = r;
   const offersByBrand: Record<string, unknown[]> = {};
   for (const r of offers) (offersByBrand[r.brand_id as string] ??= []).push(r);
+  const matchesByBrand: Record<string, unknown[]> = {};
+  for (const r of matches as any[]) (matchesByBrand[r.pending_id as string] ??= []).push({
+    id: r.id, name: r.name, slug: r.slug, base_domain: r.base_domain, status: r.status,
+  });
 
   return c.json({
     page,
@@ -1981,6 +2002,7 @@ app.get("/admin/pending-brands", async (c) => {
       candidates: candByBrand[b.id as string] ?? [],
       review: reviewByBrand[b.id as string] ?? null,
       offers: offersByBrand[b.id as string] ?? [],
+      matches: matchesByBrand[b.id as string] ?? [],
     })),
   });
 });
