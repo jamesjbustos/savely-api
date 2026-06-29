@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { getDb } from "./db.ts";
 import { buildBrandLite, buildMatcher, safeAutoMatch } from "./brandMatch.ts";
+import { sanitizeDomain } from "./brandUtils.ts";
 
 type Env = {
   DATABASE_URL: string;
@@ -2045,7 +2046,8 @@ app.patch("/admin/brands/:id", async (c) => {
   const curRow = existing[0]!;
 
   const desiredStatus = (body.status ?? curRow.status) as string;
-  const desiredBase = body.base_domain !== undefined ? body.base_domain : curRow.base_domain;
+  const desiredBase =
+    body.base_domain !== undefined ? sanitizeDomain(body.base_domain) : curRow.base_domain;
   const desiredCategory =
     body.category_id !== undefined ? body.category_id : curRow.category_id;
 
@@ -2065,7 +2067,7 @@ app.patch("/admin/brands/:id", async (c) => {
   const update: Record<string, unknown> = {};
   if (body.name !== undefined) update.name = body.name;
   if (body.slug !== undefined) update.slug = body.slug;
-  if (body.base_domain !== undefined) update.base_domain = body.base_domain || null;
+  if (body.base_domain !== undefined) update.base_domain = sanitizeDomain(body.base_domain);
   if (body.category_id !== undefined) update.category_id = body.category_id || null;
   if (body.status !== undefined) update.status = desiredStatus;
   if (Object.keys(update).length === 0) {
@@ -2472,7 +2474,7 @@ app.post("/admin/domain-reviews/decision", async (c) => {
     return c.json({ error: "brand_id and decision required" }, 400);
   }
   if (body.decision === "approve") {
-    const domain = String(body.domain || "").trim().toLowerCase();
+    const domain = sanitizeDomain(body.domain);
     if (!domain) return c.json({ error: "domain required to approve" }, 400);
     await sql`update brands set base_domain = ${domain}, updated_at = now() where id = ${body.brand_id}`;
     await sql`
@@ -2537,7 +2539,7 @@ app.post("/admin/brands", async (c) => {
   if (!name || !slug) return c.json({ error: "name and slug required" }, 400);
   const rows = await sql`
     insert into brands (name, slug, base_domain, status)
-    values (${name}, ${slug}, ${body.base_domain || null}, ${body.status || "pending"})
+    values (${name}, ${slug}, ${sanitizeDomain(body.base_domain)}, ${body.status || "pending"})
     on conflict (slug) do nothing
     returning id, name, slug, base_domain, status`;
   if (!rows.length) return c.json({ error: "slug already exists" }, 409);
@@ -2643,7 +2645,7 @@ app.post("/admin/brands/:id/domains", async (c) => {
   const sql = getDb(c.env);
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => null)) as any;
-  const domain = String(body?.domain || "").trim().toLowerCase();
+  const domain = sanitizeDomain(body?.domain);
   if (!domain) return c.json({ error: "domain required" }, 400);
   if (body.is_primary) {
     await sql`update brand_domains set is_primary = false where brand_id = ${id}`;
@@ -2674,7 +2676,7 @@ app.post("/admin/brands/:id/redeemable", async (c) => {
   const sql = getDb(c.env);
   const id = c.req.param("id");
   const body = (await c.req.json().catch(() => null)) as any;
-  const domain = String(body?.domain || "").trim().toLowerCase();
+  const domain = sanitizeDomain(body?.domain);
   if (!domain) return c.json({ error: "domain required" }, 400);
   await sql`insert into brand_redeemable_domains (brand_id, domain) values (${id}, ${domain}) on conflict do nothing`;
   await recordAudit(sql, c, "add_redeemable", "brand", id, { domain });

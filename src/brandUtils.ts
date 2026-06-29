@@ -1,3 +1,21 @@
+/**
+ * Coerce whatever an admin types into a clean, bare host for `base_domain`
+ * (and other domain fields). Keeps any "www." (some hosts need it to resolve),
+ * but strips protocols — including malformed/duplicated ones like
+ * "https://https//www.x.com" — plus paths, queries, and trailing slashes.
+ * Returns null for empty input.
+ */
+export function sanitizeDomain(input: unknown): string | null {
+  if (input == null) return null;
+  let d = String(input).trim().toLowerCase();
+  if (!d) return null;
+  // Strip one or more leading protocols, tolerating a missing colon ("https//").
+  d = d.replace(/^(https?:?\/\/+)+/g, "");
+  // Strip any path / query / hash, then stray leading dots and whitespace.
+  d = d.replace(/[/?#].*$/, "").replace(/^\.+/, "").trim();
+  return d || null;
+}
+
 export function toTitleCase(input: string): string {
   return input
     .toLowerCase()
