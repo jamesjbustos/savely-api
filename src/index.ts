@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { getDb } from "./db.ts";
 import { buildBrandLite, buildMatcher, safeAutoMatch } from "./brandMatch.ts";
 import { sanitizeDomain } from "./brandUtils.ts";
+import { getGiftcardsPromo } from "./giftcards-promotions.ts";
 
 type Env = {
   DATABASE_URL: string;
@@ -147,6 +148,65 @@ async function purgeCached(c: any, paths: string[]) {
       console.error("purgeCached error:", err);
     }
   }
+}
+
+function applyGiftcardsPromoToOffers(brandSlug: string, offers: any[]) {
+  const now = new Date();
+  
+  // Fix spelling of GiftCards.com for all giftcards provider offers
+  for (const o of offers) {
+    const providerSlug = o.provider?.slug || o.provider_slug;
+    if (providerSlug === "giftcards" || providerSlug === "giftcards-com") {
+      if (o.provider) {
+        o.provider.name = "Giftcards.com";
+      }
+      if (o.provider_name) {
+        o.provider_name = "Giftcards.com";
+      }
+    }
+  }
+
+  const promo = getGiftcardsPromo(brandSlug, now);
+  if (!promo) return;
+
+  for (const o of offers) {
+    const providerSlug = o.provider?.slug || o.provider_slug;
+    if (providerSlug === "giftcards") {
+      // Add promo discount
+      if (o.max_discount_percent != null) {
+        o.max_discount_percent += promo.discountValue;
+      } else if (o.discount_percent != null) {
+        o.discount_percent += promo.discountValue;
+      } else {
+        if ("max_discount_percent" in o) {
+          o.max_discount_percent = promo.discountValue;
+        }
+        if ("discount_percent" in o) {
+          o.discount_percent = promo.discountValue;
+        }
+      }
+      
+      // Override URL
+      o.product_url = promo.url;
+    }
+  }
+
+  // Re-sort the offers so that the boosted one is placed correctly
+  offers.sort((a, b) => {
+    const inStockA = typeof a.in_stock === "boolean" ? a.in_stock : true;
+    const inStockB = typeof b.in_stock === "boolean" ? b.in_stock : true;
+    if (inStockA !== inStockB) {
+      return inStockA ? -1 : 1;
+    }
+    const pctA = a.max_discount_percent ?? a.discount_percent ?? 0;
+    const pctB = b.max_discount_percent ?? b.discount_percent ?? 0;
+    if (pctA !== pctB) {
+      return pctB - pctA;
+    }
+    const nameA = a.provider?.name || a.provider_name || "";
+    const nameB = b.provider?.name || b.provider_name || "";
+    return nameA.localeCompare(nameB);
+  });
 }
 
 function variantToLabel(variant: string | null | undefined): string | null {
@@ -427,6 +487,8 @@ app.get("/brands/:slug", async (c) => {
       variant_label: variantToLabel(variant),
     };
   });
+
+  applyGiftcardsPromoToOffers(brandRow.slug, offersAll);
 
   // Retail providers (giftcards.com) sell at face value, i.e. 0% discount, but
   // are still a valid clickable offer. Everyone else must beat 0% to show.
@@ -1483,6 +1545,8 @@ app.get("/offers", async (c) => {
       variant_label: variantToLabel(variant),
     };
   });
+
+  applyGiftcardsPromoToOffers(canonicalBrand.slug, offers);
 
   // Optionally filter by in-store vs non in-store offers, based on query param.
   let filteredOffers = offers;
