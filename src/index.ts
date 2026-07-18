@@ -655,7 +655,7 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 120, 600);
 });
 
 // GET /categories

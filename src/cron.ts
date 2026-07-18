@@ -229,9 +229,9 @@ export async function runCardCenterCron(env: CronEnv) {
 
     await sql/* sql */ `
       insert into provider_brand_products
-        (provider_id, brand_id, variant, product_external_id, product_url, is_active, last_seen_at, last_checked_at)
+        (provider_id, brand_id, variant, product_external_id, product_url, discount_percent, is_active, last_seen_at, last_checked_at)
       values
-        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${true}, ${nowTs}, ${nowTs})
+        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${maxDiscountPercent}, ${true}, ${nowTs}, ${nowTs})
       on conflict do nothing
     `;
     await sql/* sql */ `
@@ -240,7 +240,8 @@ export async function runCardCenterCron(env: CronEnv) {
         is_active = true,
         last_seen_at = ${nowTs},
         last_checked_at = ${nowTs},
-        product_url = ${productUrl}
+        product_url = ${productUrl},
+        discount_percent = ${maxDiscountPercent}
       where provider_id = ${providerId}
         and brand_id = ${brandId}
         and variant = ${variant}
@@ -553,6 +554,76 @@ export async function runCardDepotCron(env: CronEnv) {
   );
 }
 
+const CARDCOOKIE_PRODUCT_FETCH_CONCURRENCY = 8;
+
+/** Run an async fn over items with a bounded number of concurrent workers. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      while (true) {
+        const idx = next++;
+        if (idx >= items.length) return;
+        results[idx] = await fn(items[idx], idx);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * Read the real buyable state from a CardCookie product page.
+ *
+ * CardCookie keeps a brand in the homepage grid (with an "up to X%" badge) even
+ * while its individual resale cards are momentarily sold out, so homepage
+ * presence is not proof of stock. The product page is authoritative: available
+ * cards render as `table.cards-for-brand tr.card-in-list` rows, each with its
+ * own discount in `.card-discount` and an Add-to-cart button; a sold-out brand
+ * renders no such rows, just a "notify me" block. We trust the product page so
+ * we never surface a discount a shopper can't actually add to cart.
+ *
+ * Returns null when the fetch itself fails (unknown state — the caller keeps
+ * the homepage value rather than wrongly hiding a live deal).
+ */
+async function fetchCardCookieProductStock(
+  path: string
+): Promise<{ inStock: boolean; maxDiscount: number } | null> {
+  try {
+    const res = await fetch(`https://cardcookie.com/${path}`, {
+      headers: { "user-agent": "Mozilla/5.0 (compatible; CardbayBot/1.0)" },
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const $ = loadHtml(html);
+
+    let buyableRows = 0;
+    let maxDiscount = 0;
+    $("table.cards-for-brand tr.card-in-list").each((_, el) => {
+      const $tr = $(el);
+      if (String($tr.attr("data-mute") || "").toLowerCase() === "true") return;
+      // Only count cards a shopper can actually add to cart.
+      if ($tr.find("button.add").length === 0) return;
+      buyableRows += 1;
+      const m = ($tr.find(".card-discount").text() || "").match(
+        /(\d+(\.\d+)?)\s*%/
+      );
+      if (m) maxDiscount = Math.max(maxDiscount, parseFloat(m[1]));
+    });
+
+    if (buyableRows === 0) return { inStock: false, maxDiscount: 0 };
+    return { inStock: true, maxDiscount };
+  } catch {
+    return null;
+  }
+}
+
 export async function runCardCookieCron(env: CronEnv) {
   const sql = getDb(env);
 
@@ -627,6 +698,43 @@ export async function runCardCookieCron(env: CronEnv) {
     where provider_id = ${providerId}
   `;
 
+  // 1b) Verify real stock + real buyable discount from each brand's product
+  // page. Homepage presence alone is not proof of availability, so we check the
+  // product page for every listed brand (concurrency-limited to stay gentle on
+  // CardCookie) and key the result by the URL slug (external id).
+  const stockCandidates: { externalId: string; path: string }[] = [];
+  const seenExternalIds = new Set<string>();
+  for (const el of anchors.toArray()) {
+    const href = String($(el).attr("href") || "").trim();
+    if (!href || !href.includes("/buy-gift-cards/")) continue;
+    const rawPath = href.replace(/^https?:\/\/[^/]+/i, "").replace(/^\/+/, "");
+    const m = rawPath.match(/^buy-gift-cards\/([^/?#]+)/i);
+    if (!m) continue;
+    const externalId = m[1].toLowerCase();
+    if (seenExternalIds.has(externalId)) continue;
+    seenExternalIds.add(externalId);
+    stockCandidates.push({ externalId, path: rawPath });
+  }
+
+  const stockByExternalId = new Map<
+    string,
+    { inStock: boolean; maxDiscount: number } | null
+  >();
+  const stockResults = await mapWithConcurrency(
+    stockCandidates,
+    CARDCOOKIE_PRODUCT_FETCH_CONCURRENCY,
+    (c) => fetchCardCookieProductStock(c.path)
+  );
+  stockCandidates.forEach((c, i) => {
+    stockByExternalId.set(c.externalId, stockResults[i]);
+  });
+  const soldOutCount = stockResults.filter((r) => r && !r.inStock).length;
+  const unknownCount = stockResults.filter((r) => r === null).length;
+  console.log(
+    `CardCookie cron: verified ${stockCandidates.length} product pages ` +
+      `(${soldOutCount} sold out, ${unknownCount} fetch-failed/unknown)`
+  );
+
   let processed = 0;
 
   for (const el of anchors.toArray()) {
@@ -658,8 +766,20 @@ export async function runCardCookieCron(env: CronEnv) {
 
     const providerBrandName = chosenName || externalId.replace(/-/g, " ");
     const variant = mapVariantFromStrings(providerBrandName, title);
-    const inStock = true; // appears on homepage
     const productUrl = withUtm(`https://cardcookie.com/${path}`, providerBrandName);
+
+    // Real availability from the product page. On a fetch failure (null) fall
+    // back to the homepage badge so a flaky request doesn't hide a live deal;
+    // when in stock, prefer the real buyable discount over the "up to" badge.
+    const stock = stockByExternalId.get(externalId);
+    const inStock = stock ? stock.inStock : true;
+    const effectiveDiscount = !stock
+      ? maxDiscountPercent
+      : stock.inStock
+        ? stock.maxDiscount > 0
+          ? stock.maxDiscount
+          : maxDiscountPercent
+        : 0;
 
     // Prefer existing brand strictly by external id; only create new pending
     // brands when we see a slug we've never stored before.
@@ -703,7 +823,7 @@ export async function runCardCookieCron(env: CronEnv) {
       inStock: false,
     };
     brandDiscounts.set(brandId, {
-      maxDiscount: Math.max(prev.maxDiscount, maxDiscountPercent),
+      maxDiscount: Math.max(prev.maxDiscount, effectiveDiscount),
       inStock: prev.inStock || inStock,
     });
 
@@ -712,13 +832,13 @@ export async function runCardCookieCron(env: CronEnv) {
       insert into provider_brand_products
         (provider_id, brand_id, variant, product_external_id, product_url, is_active, last_seen_at, last_checked_at)
       values
-        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${true}, ${nowTs}, ${nowTs})
+        (${providerId}, ${brandId}, ${variant}, ${externalId}, ${productUrl}, ${inStock}, ${nowTs}, ${nowTs})
       on conflict do nothing
     `;
     await sql/* sql */ `
       update provider_brand_products
       set
-        is_active = true,
+        is_active = ${inStock},
         last_seen_at = ${nowTs},
         last_checked_at = ${nowTs},
         product_url = ${productUrl}
