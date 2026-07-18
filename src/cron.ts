@@ -269,6 +269,27 @@ export async function runCardCenterCron(env: CronEnv) {
     `;
   }
 
+  // 2b) Drop orphaned discounts: rows whose product was removed (brand merge,
+  //     external-id change) and never re-created. CardCenter always writes a
+  //     product alongside every discount, and out-of-stock brands keep their
+  //     inactive product row, so a discount with no product row of any kind is
+  //     dead data that surfaces as a linkless offer in the admin dashboard.
+  const orphans = await sql/* sql */ `
+    delete from provider_brand_discounts pbd
+    where pbd.provider_id = ${providerId}
+      and not exists (
+        select 1 from provider_brand_products pbp
+        where pbp.provider_id = pbd.provider_id
+          and pbp.brand_id = pbd.brand_id
+      )
+    returning pbd.brand_id
+  `;
+  if (orphans.length > 0) {
+    console.log(
+      `CardCenter cron: removed ${orphans.length} orphaned discount row(s) with no product`
+    );
+  }
+
   // 3) Append a snapshot of the current state into history
   await sql/* sql */ `
     insert into provider_brand_discount_history (
