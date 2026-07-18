@@ -234,9 +234,29 @@ async function purgeCached(c: any, paths: string[]) {
   }
 }
 
-function applyGiftcardsPromoToOffers(brandSlug: string, offers: any[]) {
+// Giftcards.com wraps its real URL in a Rakuten affiliate link; the target
+// path carries giftcards.com's OWN brand slug, e.g.
+// ".../product-details/lego-gift-card" -> "lego". We key the promo on this,
+// not on our brand slug, because we store some brands under a different slug
+// (e.g. "the-lego-store") that would never match the promo list's "lego".
+function giftcardsProductSlug(productUrl: string | null | undefined): string | null {
+  if (!productUrl) return null;
+  try {
+    let target = productUrl;
+    // searchParams.get already percent-decodes the wrapped giftcards.com URL.
+    const murl = new URL(productUrl).searchParams.get("murl");
+    if (murl) target = murl;
+    const m = target.match(/\/product-details\/([^/?#]+)/i);
+    if (!m) return null;
+    return m[1].replace(/-gift-card$/i, "").toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function applyGiftcardsPromoToOffers(offers: any[]) {
   const now = new Date();
-  
+
   // Fix spelling of GiftCards.com for all giftcards provider offers
   for (const o of offers) {
     const providerSlug = o.provider?.slug || o.provider_slug;
@@ -250,12 +270,17 @@ function applyGiftcardsPromoToOffers(brandSlug: string, offers: any[]) {
     }
   }
 
-  const promo = getGiftcardsPromo(brandSlug, now);
-  if (!promo) return;
-
+  let applied = false;
   for (const o of offers) {
     const providerSlug = o.provider?.slug || o.provider_slug;
     if (providerSlug !== "giftcards" && providerSlug !== "giftcards-com") continue;
+
+    // Resolve the promo from giftcards.com's own brand slug (see above), so a
+    // brand stored under a different slug on our side still gets its coupon.
+    const gcSlug = giftcardsProductSlug(o.product_url);
+    if (!gcSlug) continue;
+    const promo = getGiftcardsPromo(gcSlug, now);
+    if (!promo) continue;
 
     // Fold the coupon's value into the effective discount so it ranks and
     // renders correctly. The endpoints expose the discount under different keys:
@@ -276,7 +301,10 @@ function applyGiftcardsPromoToOffers(brandSlug: string, offers: any[]) {
     o.coupon_code = promo.code;
     o.coupon_label = promo.label;
     o.coupon_expiration = promo.expiration;
+    applied = true;
   }
+
+  if (!applied) return;
 
   // Re-sort the offers so that the boosted one is placed correctly
   offers.sort((a, b) => {
@@ -575,7 +603,7 @@ app.get("/brands/:slug", async (c) => {
     };
   });
 
-  applyGiftcardsPromoToOffers(brandRow.slug, offersAll);
+  applyGiftcardsPromoToOffers(offersAll);
 
   // Retail providers (giftcards.com) sell at face value, i.e. 0% discount, but
   // are still a valid clickable offer. Everyone else must beat 0% to show.
@@ -1642,7 +1670,7 @@ app.get("/offers", async (c) => {
     };
   });
 
-  applyGiftcardsPromoToOffers(canonicalBrand.slug, offers);
+  applyGiftcardsPromoToOffers(offers);
 
   // Optionally filter by in-store vs non in-store offers, based on query param.
   let filteredOffers = offers;
