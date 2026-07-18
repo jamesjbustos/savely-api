@@ -12,6 +12,11 @@ type Env = {
   KV?: KVNamespace;
   AXIOM_TOKEN?: string;
   AXIOM_DATASET?: string;
+  // Read/query-scoped token for the website's first-party dataset (carddeals-web),
+  // where real human offer_click/view events with session_id land. The ingest token
+  // above is write-only, so the popularity cron needs a separate query token.
+  AXIOM_QUERY_TOKEN?: string;
+  AXIOM_QUERY_DATASET?: string;
   CRON_SECRET?: string;
 };
 
@@ -48,6 +53,52 @@ async function ingestToAxiom(
     }
   } catch (err) {
     console.error("[axiom] ingest error:", err);
+  }
+}
+
+// Distinct-session-count aggregation against the website analytics dataset
+// (carddeals-web, via AXIOM_QUERY_TOKEN). Returns per-group session counts.
+async function axiomDistinctSessions(
+  env: Env,
+  opts: { startTime: string; endTime: string; groupBy: string[]; filter: unknown },
+): Promise<Array<{ group: Record<string, unknown>; sessions: number }>> {
+  const token = env.AXIOM_QUERY_TOKEN || env.AXIOM_TOKEN;
+  const dataset = env.AXIOM_QUERY_DATASET || env.AXIOM_DATASET;
+  if (!token || !dataset) return [];
+  try {
+    const resp = await fetch(
+      `https://api.axiom.co/v1/datasets/${encodeURIComponent(dataset)}/query`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startTime: opts.startTime,
+          endTime: opts.endTime,
+          resolution: "auto",
+          aggregations: [{ op: "distinct", field: "session_id", alias: "sessions" }],
+          groupBy: opts.groupBy,
+          filter: opts.filter,
+        }),
+      },
+    );
+    if (!resp.ok) return [];
+    const result = (await resp.json()) as {
+      buckets?: {
+        totals?: Array<{
+          group?: Record<string, unknown>;
+          aggregations?: Array<{ value?: unknown }>;
+        }>;
+      };
+    };
+    return (result.buckets?.totals ?? []).map((t) => ({
+      group: t.group ?? {},
+      sessions: Number(t.aggregations?.[0]?.value ?? 0) || 0,
+    }));
+  } catch {
+    return [];
   }
 }
 
@@ -91,12 +142,45 @@ function getCache() {
 
 // Cache helper: checks cache, returns cached response if fresh, otherwise null.
 // Uses Cache-Control max-age natively instead of manual timestamp tracking.
+// Constant-time comparison for secrets/tokens, so response timing can't be used
+// to recover a secret byte-by-byte. A length mismatch short-circuits (leaking
+// only length, which isn't sensitive for these fixed-length secrets).
+function safeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  if (ab.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.length; i++) diff |= ab[i]! ^ bb[i]!;
+  return diff === 0;
+}
+
+// Only these query params legitimately vary a cached response — the union of
+// every param any cacheable route reads. Everything else (junk like ?_=123) is
+// stripped from the cache key so it can't be used to bust the cache and hammer
+// the DB with unique-URL requests. Keys are sorted so param order is canonical.
+const CACHE_KEY_PARAMS = new Set([
+  "q", "starts_with", "category", "min_discount", "max_discount", "sort",
+  "page", "page_size", "limit", "window_hours", "days", "in_store", "domain",
+  "provider", "status", "per_page", "window_days",
+]);
+
+function canonicalCacheUrl(rawUrl: string): string {
+  const u = new URL(rawUrl);
+  const kept = new URLSearchParams();
+  for (const key of [...u.searchParams.keys()].sort()) {
+    if (CACHE_KEY_PARAMS.has(key)) kept.set(key, u.searchParams.get(key) ?? "");
+  }
+  u.search = kept.toString();
+  return u.toString();
+}
+
 // Cached responses are rebuilt with mutable headers so downstream middleware
 // (e.g. security headers) can modify them without hitting "immutable headers" errors.
 async function getCached(url: string): Promise<{ cache: any; cacheKey: Request; cached: Response | null }> {
   const cache = getCache();
   if (!cache) return { cache: null, cacheKey: null as any, cached: null };
-  const cacheKey = new Request(url, { method: "GET" });
+  const cacheKey = new Request(canonicalCacheUrl(url), { method: "GET" });
   const match = await cache.match(cacheKey);
   if (!match) return { cache, cacheKey, cached: null };
   // Reconstruct with mutable headers — Cache API responses have immutable headers
@@ -781,7 +865,7 @@ app.get("/popular-brands", async (c) => {
         window_hours: kvData.window_hours ?? 24,
         limit,
         brands,
-        source: "analytics_engine",
+        source: kvData.source ?? "axiom_intent",
         computed_at: kvData.computed_at ?? null,
       });
       return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
@@ -1233,9 +1317,18 @@ app.get("/analytics/live-offers", async (c) => {
   return cacheResponse(response, cache, cacheKey, c.executionCtx, 600, 3600);
 });
 
-// API key protection for extension-only endpoints.
-// Requires matching x-extension-key header.
-const protectedPaths = ["/analytics", "/offers", "/brand-domains", "/feedback", "/events"] as const;
+// API key protection for extension-only endpoints. Requires a matching
+// x-extension-key header.
+//
+// NOTE: /analytics/* is intentionally PUBLIC and is NOT listed here — the
+// website's homepage rails fetch it directly from the browser (no ext key
+// available), so gating it would break them. (It was previously listed but
+// never actually matched: app.use("/analytics") matches only the exact path,
+// not "/analytics/biggest-price-drops", and was registered after the routes —
+// so those endpoints were already public. This just makes the intent honest.)
+// The ext key ships inside the distributed extension, so it's an
+// anti-casual-abuse measure only; real protection is rate limiting.
+const protectedPaths = ["/offers", "/brand-domains", "/feedback", "/events"] as const;
 
 for (const path of protectedPaths) {
   app.use(path, async (c, next) => {
@@ -1244,7 +1337,7 @@ for (const path of protectedPaths) {
       return c.json({ error: "Internal server error" }, 500);
     }
     const provided = c.req.header("x-extension-key") || "";
-    if (provided !== expected) {
+    if (!safeEqual(provided, expected)) {
       return c.json({ error: "Unauthorized" }, 401);
     }
     return next();
@@ -1773,34 +1866,58 @@ async function handleScheduled(env: Env) {
     return;
   }
 
-  const token = env.AXIOM_TOKEN;
-  const dataset = env.AXIOM_DATASET;
+  // Prefer the query-scoped token + website dataset (carddeals-web), where real human
+  // offer_click/view events with session_id land. Fall back to the ingest token/dataset
+  // (savely_events) for back-compat when the query token isn't configured yet — that
+  // dataset carries no session_id, so the query below yields 0 rows → DB fallback,
+  // i.e. identical to today's behavior until AXIOM_QUERY_TOKEN is set.
+  const token = env.AXIOM_QUERY_TOKEN || env.AXIOM_TOKEN;
+  const dataset = env.AXIOM_QUERY_DATASET || env.AXIOM_DATASET;
 
   if (!token || !dataset) {
-    console.warn("[cron] AXIOM_TOKEN or AXIOM_DATASET not set, using DB fallback");
+    console.warn("[cron] No Axiom query token/dataset set, using DB fallback");
     await computePopularBrandsFromDb(env, kv);
     return;
   }
 
-  try {
-    // APL query: top brands by view count in last 24h, combining extension + website views.
-    // Group by brand_slug (present in both sources). brand_id is only set by extension.
-    const apl = `['${dataset}']
-| where event == 'view'
-| where _time > ago(24h)
-| where isnotnull(brand_slug) and brand_slug != ''
-| summarize view_count = count() by brand_slug
-| order by view_count desc
-| take 100`;
+  // Intent-weighted demand over a 14-day window. offer_click is real buy-intent and
+  // crawler-resistant; view is bot-heavy so it counts far less. We count DISTINCT
+  // sessions (not raw events) so a bot rendering a page repeatedly can't inflate a brand.
+  const WINDOW_HOURS = 336;
+  const CLICK_WEIGHT = 3;
+  const VIEW_WEIGHT = 1;
 
-    const resp = await fetch("https://api.axiom.co/v1/datasets/_apl/query?format=tabular", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ apl }),
-    });
+  try {
+    // Axiom's shared _apl/query endpoint 404s for this org, and the dataset-scoped
+    // /query endpoint ignores APL — so we use its native structured aggregation:
+    // distinct session_id, grouped by (brand_slug, event), for offer_click + view.
+    const endTime = new Date().toISOString();
+    const startTime = new Date(Date.now() - WINDOW_HOURS * 3600 * 1000).toISOString();
+
+    const resp = await fetch(
+      `https://api.axiom.co/v1/datasets/${encodeURIComponent(dataset)}/query`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startTime,
+          endTime,
+          resolution: "auto",
+          aggregations: [{ op: "distinct", field: "session_id", alias: "sessions" }],
+          groupBy: ["brand_slug", "event"],
+          filter: {
+            op: "or",
+            children: [
+              { op: "==", field: "event", value: "offer_click" },
+              { op: "==", field: "event", value: "view" },
+            ],
+          },
+        }),
+      }
+    );
 
     if (!resp.ok) {
       const errText = await resp.text();
@@ -1810,34 +1927,49 @@ async function handleScheduled(env: Env) {
     }
 
     const result = await resp.json() as {
-      tables?: Array<{
-        columns: string[];
-        rows?: Array<Array<unknown>>;
-      }>;
+      buckets?: {
+        totals?: Array<{
+          group?: Record<string, unknown>;
+          aggregations?: Array<{ op?: string; value?: unknown }>;
+        }>;
+      };
     };
 
-    const table = result.tables?.[0];
-    const columns = table?.columns ?? [];
-    const rows = table?.rows ?? [];
+    const totals = result.buckets?.totals ?? [];
 
-    const brandSlugIdx = columns.indexOf("brand_slug");
-    const viewCountIdx = columns.indexOf("view_count");
+    // Fold the (brand_slug, event) groups into a per-brand intent score.
+    const scoreBySlug = new Map<string, { click: number; view: number }>();
+    for (const t of totals) {
+      const slug = String(t.group?.brand_slug ?? "");
+      if (!slug) continue;
+      const evt = String(t.group?.event ?? "");
+      const sessions = Number(t.aggregations?.[0]?.value ?? 0) || 0;
+      const entry = scoreBySlug.get(slug) ?? { click: 0, view: 0 };
+      if (evt === "offer_click") entry.click += sessions;
+      else if (evt === "view") entry.view += sessions;
+      scoreBySlug.set(slug, entry);
+    }
 
-    const axiomRows: Array<{ brand_slug: string; view_count: number }> =
-      rows.map((row) => ({
-        brand_slug: String(row[brandSlugIdx] ?? ""),
-        view_count: Number(row[viewCountIdx] ?? 0),
-      })).filter((r) => r.brand_slug);
+    const scored = [...scoreBySlug.entries()]
+      .map(([slug, s]) => ({
+        slug,
+        click_sessions: s.click,
+        view_sessions: s.view,
+        demand: s.click * CLICK_WEIGHT + s.view * VIEW_WEIGHT,
+      }))
+      .filter((r) => r.demand > 0)
+      .sort((a, b) => b.demand - a.demand)
+      .slice(0, 100);
 
-    if (axiomRows.length === 0) {
-      console.warn("[cron] No Axiom data yet, falling back to DB");
+    if (scored.length === 0) {
+      console.warn("[cron] No Axiom intent data yet, falling back to DB");
       await computePopularBrandsFromDb(env, kv);
       return;
     }
 
-    // Enrich with current discount data from Supabase, matched by slug
+    // Enrich with current discount data from Supabase, matched by slug (in-stock only)
     const sql = getDb(env);
-    const slugs = axiomRows.map((r) => r.brand_slug);
+    const slugs = scored.map((r) => r.slug);
 
     const discountRows = await sql/* sql */ `
       select
@@ -1862,33 +1994,43 @@ async function handleScheduled(env: Env) {
       discountMap.set(r.slug, r);
     }
 
-    const brands = axiomRows
-      .filter((r) => discountMap.has(r.brand_slug))
+    const brands = scored
+      .filter((r) => discountMap.has(r.slug))
       .map((r) => {
-        const d = discountMap.get(r.brand_slug)!;
+        const d = discountMap.get(r.slug)!;
         return {
           id: d.brand_id as string,
           name: d.name as string,
           slug: d.slug as string,
           base_domain: (d.base_domain as string | null) ?? null,
           category_name: (d.category_name as string | null) ?? null,
-          event_count: r.view_count,
+          event_count: r.demand,
+          click_sessions: r.click_sessions,
+          view_sessions: r.view_sessions,
           max_discount_percent:
             typeof d.max_discount === "number" ? d.max_discount : Number(d.max_discount) || 0,
         };
       });
 
+    // Every scored brand may be out of stock / 0% right now — keep KV usable.
+    if (brands.length === 0) {
+      console.warn("[cron] Axiom intent brands not in-stock, falling back to DB");
+      await computePopularBrandsFromDb(env, kv);
+      return;
+    }
+
     await kv.put(
       "popular-brands",
       JSON.stringify({
-        window_hours: 24,
+        window_hours: WINDOW_HOURS,
         brands,
         computed_at: new Date().toISOString(),
+        source: "axiom_intent",
       }),
       { expirationTtl: 3600 }
     );
 
-    console.log(`[cron] Computed popular brands from Axiom: ${brands.length} brands`);
+    console.log(`[cron] Computed popular brands from Axiom intent: ${brands.length} brands`);
   } catch (err) {
     console.error("[cron] Error computing popular brands:", err);
     await computePopularBrandsFromDb(env, kv);
@@ -1952,7 +2094,7 @@ async function computePopularBrandsFromDb(env: Env, kv: KVNamespace) {
 app.post("/internal/compute-popular-brands", async (c) => {
   const authHeader = c.req.header("authorization") || "";
   const expected = `Bearer ${c.env.CRON_SECRET ?? ""}`;
-  if (!c.env.CRON_SECRET || authHeader !== expected) {
+  if (!c.env.CRON_SECRET || !safeEqual(authHeader, expected)) {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await handleScheduled(c.env);
@@ -1999,7 +2141,7 @@ app.get("/search-index", async (c) => {
 // pending brands -> pick correct base_domain (from candidates) + category -> activate.
 app.use("/admin/*", async (c, next) => {
   const authHeader = c.req.header("authorization") || "";
-  if (!c.env.CRON_SECRET || authHeader !== `Bearer ${c.env.CRON_SECRET}`) {
+  if (!c.env.CRON_SECRET || !safeEqual(authHeader, `Bearer ${c.env.CRON_SECRET}`)) {
     return c.json({ error: "Unauthorized" }, 401);
   }
   await next();
@@ -2046,11 +2188,26 @@ app.get("/admin/pending-brands", async (c) => {
     from brand_domain_reviews
     where brand_id = any(${ids}::uuid[])`;
   // Provider offers (incl. the affiliate/product URL) so admins can preview the link.
+  // v_brand_provider_offers only exposes product_url for the *active* product row, so a
+  // pending brand whose provider offer has gone out of stock (product deactivated by the
+  // cron) shows a discount but no link. Backfill product_url from the stored product row
+  // regardless of is_active so the admin preview link is always available.
   const offers = await sql`
-    select brand_id, provider_name, provider_slug, max_discount_percent, in_stock, product_url, variant
-    from v_brand_provider_offers
-    where brand_id = any(${ids}::uuid[])
-    order by max_discount_percent desc nulls last`;
+    select o.brand_id, o.provider_name, o.provider_slug, o.max_discount_percent,
+           o.in_stock, o.variant,
+           coalesce(o.product_url, pu.product_url) as product_url
+    from v_brand_provider_offers o
+    left join lateral (
+      select pbp.product_url
+      from provider_brand_products pbp
+      where pbp.brand_id = o.brand_id
+        and pbp.provider_id = o.provider_id
+        and pbp.product_url is not null
+      order by pbp.last_seen_at desc nulls last
+      limit 1
+    ) pu on o.product_url is null
+    where o.brand_id = any(${ids}::uuid[])
+    order by o.max_discount_percent desc nulls last`;
   // Likely existing (non-pending) brands this pending one may be a duplicate of,
   // by name/slug substring — for one-click "merge into existing".
   const matches = await sql`
@@ -2381,6 +2538,72 @@ app.post("/admin/unmatched-products/accept-suggested", async (c) => {
 });
 
 // ── Dashboard stats ──────────────────────────────────────────────
+// Sell (cash-out) funnel: distinct sessions per step from the website analytics
+// dataset (carddeals-web). Reuses AXIOM_QUERY_TOKEN; under /admin/* so it's
+// Bearer-protected by the middleware above.
+app.get("/admin/sell-funnel", async (c) => {
+  const daysRaw = Number.parseInt(c.req.query("days") || "30", 10);
+  const days = Number.isFinite(daysRaw) ? Math.min(Math.max(daysRaw, 1), 90) : 30;
+  const endTime = new Date().toISOString();
+  const startTime = new Date(Date.now() - days * 86400000).toISOString();
+
+  const STEP_EVENTS = [
+    "sell_quote_viewed",
+    "buyout_submission_created",
+    "sell_complete_viewed",
+    "sell_kyc_started",
+    "sell_kyc_approved",
+    "sell_payout_started",
+    "sell_payout_connected",
+    "sell_completed",
+  ];
+
+  const [byEvent, sellViews] = await Promise.all([
+    axiomDistinctSessions(c.env, {
+      startTime,
+      endTime,
+      groupBy: ["event"],
+      filter: {
+        op: "or",
+        children: STEP_EVENTS.map((e) => ({ op: "==", field: "event", value: e })),
+      },
+    }),
+    axiomDistinctSessions(c.env, {
+      startTime,
+      endTime,
+      groupBy: ["event"],
+      filter: {
+        op: "and",
+        children: [
+          { op: "==", field: "event", value: "pageview" },
+          { op: "==", field: "path", value: "/sell" },
+        ],
+      },
+    }),
+  ]);
+
+  const counts = new Map<string, number>();
+  for (const r of byEvent) counts.set(String(r.group.event ?? ""), r.sessions);
+
+  const steps = [
+    { key: "sell_view", label: "Visited sell page", sessions: sellViews[0]?.sessions ?? 0 },
+    { key: "sell_quote_viewed", label: "Saw a quote", sessions: counts.get("sell_quote_viewed") ?? 0 },
+    { key: "buyout_submission_created", label: "Submitted a card", sessions: counts.get("buyout_submission_created") ?? 0 },
+    { key: "sell_complete_viewed", label: "Reached checkout", sessions: counts.get("sell_complete_viewed") ?? 0 },
+    { key: "sell_kyc_started", label: "Started verification", sessions: counts.get("sell_kyc_started") ?? 0 },
+    { key: "sell_kyc_approved", label: "Verified identity", sessions: counts.get("sell_kyc_approved") ?? 0 },
+    { key: "sell_payout_started", label: "Started payout setup", sessions: counts.get("sell_payout_started") ?? 0 },
+    { key: "sell_payout_connected", label: "Connected payout", sessions: counts.get("sell_payout_connected") ?? 0 },
+    { key: "sell_completed", label: "Completed", sessions: counts.get("sell_completed") ?? 0 },
+  ];
+
+  return c.json({
+    configured: Boolean(c.env.AXIOM_QUERY_TOKEN || c.env.AXIOM_TOKEN),
+    days,
+    steps,
+  });
+});
+
 app.get("/admin/dashboard-stats", async (c) => {
   const sql = getDb(c.env);
   // Run sequentially: concurrent queries on one connection over the Supabase
