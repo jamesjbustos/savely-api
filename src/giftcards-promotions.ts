@@ -1,8 +1,7 @@
 export interface GiftcardsPromo {
   code: string
-  discountValue: number // 10
+  discountValue: number // percentage points added to the effective discount
   label: string
-  url: string
   expiration: string
 }
 
@@ -148,7 +147,6 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
         code,
         discountValue: 10,
         label: "Flash Sale",
-        url: "https://eoaclk.com/diucZoPj9g/boIinK7DrQw/",
         expiration: "Ends today",
       }
     }
@@ -162,7 +160,6 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
         code: "DAILYDEAL",
         discountValue: 10,
         label: "Daily Deal",
-        url: "https://eoaclk.com/PgIZj6bNsw/boIinK7DrQw/",
         expiration: "Ends today",
       }
     }
@@ -172,7 +169,6 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
         code: "SCHOOL10",
         discountValue: 10,
         label: "Back-to-School Sale",
-        url: "https://eoaclk.com/HfVd2X254N/boIinK7DrQw/",
         expiration: dateStr === "2026-07-23" ? "Ends today" : "Ends July 23",
       }
     }
@@ -185,7 +181,6 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
       code: "DAILYDEAL",
       discountValue: 10,
       label: "Daily Deal",
-      url: "https://eoaclk.com/PgIZj6bNsw/boIinK7DrQw/",
       expiration: "Ends today",
     }
   }

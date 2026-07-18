@@ -171,24 +171,27 @@ function applyGiftcardsPromoToOffers(brandSlug: string, offers: any[]) {
 
   for (const o of offers) {
     const providerSlug = o.provider?.slug || o.provider_slug;
-    if (providerSlug === "giftcards") {
-      // Add promo discount
-      if (o.max_discount_percent != null) {
-        o.max_discount_percent += promo.discountValue;
-      } else if (o.discount_percent != null) {
-        o.discount_percent += promo.discountValue;
-      } else {
-        if ("max_discount_percent" in o) {
-          o.max_discount_percent = promo.discountValue;
-        }
-        if ("discount_percent" in o) {
-          o.discount_percent = promo.discountValue;
-        }
-      }
-      
-      // Override URL
-      o.product_url = promo.url;
+    if (providerSlug !== "giftcards" && providerSlug !== "giftcards-com") continue;
+
+    // Fold the coupon's value into the effective discount so it ranks and
+    // renders correctly. The endpoints expose the discount under different keys:
+    // /offers uses max_discount_percent, /brands/:slug uses discount_percent.
+    if (o.max_discount_percent != null) {
+      o.max_discount_percent += promo.discountValue;
+    } else if (o.discount_percent != null) {
+      o.discount_percent += promo.discountValue;
+    } else if ("max_discount_percent" in o) {
+      o.max_discount_percent = promo.discountValue;
+    } else if ("discount_percent" in o) {
+      o.discount_percent = promo.discountValue;
     }
+
+    // Surface the coupon so every consumer (web + extension) renders it
+    // identically. product_url is left untouched: it is the brand-specific
+    // Rakuten affiliate link, and the code applies at checkout.
+    o.coupon_code = promo.code;
+    o.coupon_label = promo.label;
+    o.coupon_expiration = promo.expiration;
   }
 
   // Re-sort the offers so that the boosted one is placed correctly
