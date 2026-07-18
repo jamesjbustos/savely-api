@@ -135,14 +135,26 @@ export function getEasternDateString(date: Date = new Date()): string {
   }
 }
 
+// giftcards.com's product slugs are sometimes more specific than the email's
+// short brand names (e.g. "raising-canes-chicken-fingers" vs "raising-canes",
+// "carters-oshkosh-bgosh" vs "carters"). Match a set entry if the slug equals
+// it or extends it at a hyphen boundary, so those still resolve. The boundary
+// avoids partial-word hits ("belk" must not match "belkin").
+function matchesBrand(slug: string, entries: Iterable<string>): boolean {
+  for (const e of entries) {
+    if (slug === e || slug.startsWith(`${e}-`)) return true
+  }
+  return false
+}
+
 export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): GiftcardsPromo | null {
   const dateStr = getEasternDateString(date)
   const slug = brandSlug.toLowerCase()
 
   // 1. Flash Sale: 2026-07-18 only
   if (dateStr === "2026-07-18") {
-    if (FLASH_SALE_BRANDS.has(slug)) {
-      const code = (slug === "bath-and-body-works" || slug === "bath-body-works") ? "STRIKE" : "FLASH"
+    if (matchesBrand(slug, FLASH_SALE_BRANDS)) {
+      const code = matchesBrand(slug, ["bath-and-body-works", "bath-body-works"]) ? "STRIKE" : "FLASH"
       return {
         code,
         discountValue: 10,
@@ -154,8 +166,7 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
 
   // 2. Back-to-School Sale: 2026-07-19 to 2026-07-23
   if (dateStr >= "2026-07-19" && dateStr <= "2026-07-23") {
-    const dailyDealsToday = DAILY_DEALS[dateStr] || []
-    if (dailyDealsToday.includes(slug)) {
+    if (matchesBrand(slug, DAILY_DEALS[dateStr] || [])) {
       return {
         code: "DAILYDEAL",
         discountValue: 10,
@@ -164,7 +175,7 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
       }
     }
 
-    if (BTS_BRANDS.has(slug)) {
+    if (matchesBrand(slug, BTS_BRANDS)) {
       return {
         code: "SCHOOL10",
         discountValue: 10,
@@ -175,8 +186,7 @@ export function getGiftcardsPromo(brandSlug: string, date: Date = new Date()): G
   }
 
   // 3. Daily Deals: 2026-07-20 to 2026-08-02
-  const dailyDealsToday = DAILY_DEALS[dateStr]
-  if (dailyDealsToday && dailyDealsToday.includes(slug)) {
+  if (matchesBrand(slug, DAILY_DEALS[dateStr] || [])) {
     return {
       code: "DAILYDEAL",
       discountValue: 10,
