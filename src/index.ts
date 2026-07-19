@@ -384,10 +384,35 @@ app.get("/brands", async (c) => {
     : 24;
   const offset = (page - 1) * pageSize;
 
+  // "Most Popular" (sort=relevance, the UI default) orders by real demand from
+  // Axiom intent — offer clicks + views over a 14-day window — precomputed into
+  // the popular-brands KV entry by the scheduled job. Brands outside the ranked
+  // set, and the case where no popularity data exists yet, fall through to
+  // best-discount order so the listing is always sensibly sorted.
+  const isPopularSort = sortParam === "relevance" || sortParam === "popular";
+  let popularSlugs: string[] = [];
+  if (isPopularSort) {
+    const kv = c.env.KV;
+    if (kv) {
+      try {
+        const kvData = (await kv.get("popular-brands", "json")) as any;
+        if (kvData && Array.isArray(kvData.brands)) {
+          popularSlugs = kvData.brands
+            .map((b: any) => String(b?.slug ?? ""))
+            .filter(Boolean);
+        }
+      } catch (err) {
+        console.error("[brands] popular-brands KV read failed:", err);
+      }
+    }
+  }
+
   const orderBy =
     sortParam === "newest"
       ? sql`order by coalesce(last_deal_updated, brand_created_at) desc nulls last, brand_name asc`
-      : sortParam === "discount_desc" || sortParam === "relevance"
+      : isPopularSort && popularSlugs.length > 0
+      ? sql`order by array_position(${popularSlugs}::text[], brand_slug) nulls last, best_discount desc nulls last, brand_name asc`
+      : sortParam === "discount_desc" || isPopularSort
       ? sql`order by best_discount desc nulls last, brand_name asc`
       : sortParam === "discount_asc"
       ? sql`order by best_discount asc nulls last, brand_name asc`
