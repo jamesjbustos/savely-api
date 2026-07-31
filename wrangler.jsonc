@@ -28,6 +28,15 @@
       "id": "66ad293921d54eaa8859d5ac4befd993"
     }
   ],
+  // Self-hosted Postgres on the Hetzner box, reached over a Cloudflare Tunnel
+  // gated by Access. Read caching is left on here: brand/discount data is public
+  // and tolerates a short staleness window.
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "d1183b28d5734ea6816fe4ab559cb656"
+    }
+  ],
   "triggers": {
     "crons": ["*/15 * * * *"]
   }
