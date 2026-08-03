@@ -757,10 +757,10 @@ export async function runCardCookieCron(env: CronEnv) {
     const externalId = pathMatch[1].toLowerCase();
 
     const maxDiscountPercent = (() => {
-      const m = dataPct.match(/(\d+(\.\d+)?)\s*%/);
+      const m = dataPct.match(/(\d*\.?\d+)\s*%/);
       if (m) return parseFloat(m[1]);
       const t = $a.find(".giftCard-discount").text() || "";
-      const m2 = t.match(/(\d+(\.\d+)?)\s*%/);
+      const m2 = t.match(/(\d*\.?\d+)\s*%/);
       return m2 ? parseFloat(m2[1]) : 0;
     })();
 
