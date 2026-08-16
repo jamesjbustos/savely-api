@@ -680,12 +680,12 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  // 5s, and deliberately NO stale-while-revalidate.
+  // 2s, and deliberately NO stale-while-revalidate.
   //
   // This layer exists to protect the origin, and the origin barely needs
   // protecting: the database is 64MB with a 99.97% buffer hit ratio, so it
   // is served entirely from RAM on a box sitting at 0.4 load. What this TTL
-  // actually buys is a bound on worst-case origin QPS - at 5s, even if all
+  // actually buys is a bound on worst-case origin QPS - at 2s, even if all
   // ~900 brands were requested continuously, the origin sees at most
   // ~450 queries/sec, which this database absorbs without noticing.
   //

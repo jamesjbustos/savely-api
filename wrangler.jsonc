@@ -35,8 +35,10 @@
   //
   // Commented out on 2026-08-03 after hitting the free-plan Hyperdrive query
   // cap (100k/day). The account moved to Workers Paid on 2026-08-16, which
-  // removes that cap. Query caching on this config is set to 10s so a stale
-  // query result cannot defeat on-demand revalidation above it.
+  // removes that cap. Hyperdrive's own query cache is DISABLED on this config:
+  // it is pooling we need here, not caching, and a cached query result would
+  // defeat the on-demand invalidation layered above it. The database is 64MB
+  // with a 99.97% buffer hit ratio, so uncached reads cost effectively nothing.
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
