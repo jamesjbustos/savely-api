@@ -680,11 +680,24 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  // 15s + 30s SWR, not 120s + 600s. This sits under Next.js on-demand
-  // revalidation: a longer TTL here means an invalidated page rebuilds
-  // against data this layer is still serving stale. 15s still absorbs a
-  // burst - one origin fetch covers every request in that window.
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 15, 30);
+  // 5s, and deliberately NO stale-while-revalidate.
+  //
+  // This layer exists to protect the origin, and the origin barely needs
+  // protecting: the database is 64MB with a 99.97% buffer hit ratio, so it
+  // is served entirely from RAM on a box sitting at 0.4 load. What this TTL
+  // actually buys is a bound on worst-case origin QPS - at 5s, even if all
+  // ~900 brands were requested continuously, the origin sees at most
+  // ~450 queries/sec, which this database absorbs without noticing.
+  //
+  // The SWR window is gone on purpose. Stale-while-revalidate means the
+  // next visitor after expiry still receives the OLD price and only the one
+  // after that sees the new one. On a price-comparison site that is the
+  // failure mode we are removing, not a performance win worth keeping.
+  //
+  // Together with push-based invalidation above (Postgres NOTIFY -> the web
+  // app's /api/revalidate), this puts a price change in front of a visitor
+  // in seconds rather than the ~17 minutes the timer stack used to take.
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 2, 0);
 });
 
 // GET /categories
