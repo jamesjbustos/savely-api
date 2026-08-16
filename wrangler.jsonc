@@ -28,14 +28,23 @@
       "id": "66ad293921d54eaa8859d5ac4befd993"
     }
   ],
-  // Self-hosted Postgres on the Hetzner box, reached over a Cloudflare Tunnel
-  // gated by Access. Disabled Hyperdrive due to Cloudflare limit; using DATABASE_URL.
-  // "hyperdrive": [
-  //   {
-  //     "binding": "HYPERDRIVE",
-  //     "id": "d1183b28d5734ea6816fe4ab559cb656"
-  //   }
-  // ],
+  // Self-hosted Postgres on the Hetzner box. Hyperdrive is REQUIRED, not
+  // optional: raw Worker connect() egress is not inside Cloudflare's published
+  // IP ranges, so a direct DATABASE_URL connection is dropped by the origin
+  // firewall and times out. Hyperdrive egresses from in-range IPs.
+  //
+  // Commented out on 2026-08-03 after hitting the free-plan Hyperdrive query
+  // cap (100k/day). The account moved to Workers Paid on 2026-08-16, which
+  // removes that cap. Hyperdrive's own query cache is DISABLED on this config:
+  // it is pooling we need here, not caching, and a cached query result would
+  // defeat the on-demand invalidation layered above it. The database is 64MB
+  // with a 99.97% buffer hit ratio, so uncached reads cost effectively nothing.
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "d1183b28d5734ea6816fe4ab559cb656"
+    }
+  ],
   "triggers": {
     "crons": ["*/15 * * * *"]
   }
