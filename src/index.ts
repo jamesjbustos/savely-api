@@ -680,7 +680,11 @@ app.get("/brands/:slug", async (c) => {
     offers: clickableOffers,
   });
 
-  return cacheResponse(response, cache, cacheKey, c.executionCtx, 120, 600);
+  // 15s + 30s SWR, not 120s + 600s. This sits under Next.js on-demand
+  // revalidation: a longer TTL here means an invalidated page rebuilds
+  // against data this layer is still serving stale. 15s still absorbs a
+  // burst - one origin fetch covers every request in that window.
+  return cacheResponse(response, cache, cacheKey, c.executionCtx, 15, 30);
 });
 
 // GET /categories
