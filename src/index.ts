@@ -1675,14 +1675,6 @@ app.get("/offers", async (c) => {
       v.provider_name asc
   `;
 
-  if (!rows.length) {
-    return c.json({
-      brand: null,
-      bestOffer: null,
-      offers: [],
-    });
-  }
-
   const brand = {
     id: canonicalBrand.id as string,
     name: canonicalBrand.name as string,
@@ -1712,6 +1704,55 @@ app.get("/offers", async (c) => {
     };
   });
 
+  // Step 2.5: Look up CardDeals-owned cards listed for resale (buyout inventory)
+  try {
+    const buyoutRes = await fetch(
+      `https://api.carddeals.co/api/buyout/inventory/${encodeURIComponent(canonicalBrand.slug)}`,
+      { headers: { Accept: "application/json" } }
+    );
+    if (buyoutRes.ok) {
+      const buyoutData = (await buyoutRes.json()) as {
+        listings?: Array<{ id: string; balance: number; price: number; discountPercent: number }>;
+      };
+      const listings = buyoutData.listings ?? [];
+      if (listings.length > 0) {
+        const best = listings.reduce((a, b) =>
+          b.discountPercent > a.discountPercent ? b : a
+        );
+        if (best.discountPercent > 0) {
+          const productUrl =
+            listings.length === 1
+              ? `https://carddeals.co/buy/${best.id}`
+              : `https://carddeals.co/brands/${canonicalBrand.slug}`;
+
+          offers.push({
+            provider: {
+              id: "carddeals",
+              name: "CardDeals",
+              slug: "carddeals",
+            },
+            max_discount_percent: best.discountPercent,
+            in_stock: true,
+            fetched_at: new Date().toISOString(),
+            product_url: productUrl,
+            variant: "online",
+            variant_label: "Sold by CardDeals",
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[offers] buyout fetch error:", err);
+  }
+
+  if (!offers.length) {
+    return c.json({
+      brand: null,
+      bestOffer: null,
+      offers: [],
+    });
+  }
+
   applyGiftcardsPromoToOffers(offers);
 
   // Optionally filter by in-store vs non in-store offers, based on query param.
@@ -1735,8 +1776,26 @@ app.get("/offers", async (c) => {
       o.max_discount_percent > 0
   );
 
+  // Sort clickable offers:
+  // 1. Highest discount first
+  // 2. Tie-breaker: CardDeals comes first if discounts are equal
+  // 3. Fallback: alphabetical by provider name
+  clickableOffers.sort((a, b) => {
+    const discA = a.max_discount_percent ?? 0;
+    const discB = b.max_discount_percent ?? 0;
+    if (discB !== discA) {
+      return discB - discA;
+    }
+    const aIsCardDeals = a.provider.slug === "carddeals";
+    const bIsCardDeals = b.provider.slug === "carddeals";
+    if (aIsCardDeals !== bIsCardDeals) {
+      return aIsCardDeals ? -1 : 1;
+    }
+    return a.provider.name.localeCompare(b.provider.name);
+  });
+
   // Best offer: first in-stock row by discount, with a non-empty URL
-  // (thanks to SQL ordering, clickableOffers[0] is the best).
+  // (thanks to sorting above, clickableOffers[0] is the best, with CardDeals winning ties).
   const bestOffer = clickableOffers[0] || null;
 
   const response = c.json({
