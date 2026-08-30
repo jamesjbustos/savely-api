@@ -1737,6 +1737,7 @@ app.get("/offers", async (c) => {
             product_url: productUrl,
             variant: "online",
             variant_label: "Sold by CardDeals",
+            listings,
           });
         }
       }
